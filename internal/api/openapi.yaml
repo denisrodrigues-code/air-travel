@@ -1,0 +1,630 @@
+openapi: 3.1.0
+
+info:
+  title: airtravel
+  version: 1.0.0
+  description: |
+    Consome a API interna do motor de reservas da TAP Air Portugal
+    (plataforma BFM), persiste os dados tratados no PostgreSQL e as respostas
+    brutas no Redis, e devolve os voos já parseados.
+
+    ## Três formas de coletar
+
+    | Rota | Custo | O que devolve |
+    |---|---|---|
+    | `POST /api/v1/searches` | 1 requisição por data | voos, horários, segmentos e tarifas |
+    | `GET /api/v1/calendar` | 1 requisição por rota | melhor preço em ~365 datas de partida |
+    | `GET /api/v1/returns` | 1 requisição por data de ida | preço total em ~337 datas de volta |
+
+    Os endpoints `GET` leem do banco por padrão. Use `refresh=true` para coletar
+    na TAP antes de responder — é a operação cara, porque consulta o GDS.
+
+    ## Horários são hora local
+
+    Os horários de voo são a hora de parede do aeroporto, sem fuso. Não subtraia
+    `departureTime` de `arrivalTime` para obter duração: use `durationMinutes`.
+    Um voo LIS→GRU 23:30→05:50 dura 620 minutos, não 380.
+
+    ## Mercado define a moeda e as tarifas
+
+    `market` não é conversão de câmbio: é o conjunto tarifário. A mesma rota sai
+    ~19% mais barata em termos reais no mercado `BR` do que no `PT`.
+  license:
+    name: uso interno
+
+servers:
+  - url: http://localhost:8080
+    description: desenvolvimento local
+
+tags:
+  - name: coleta
+    description: captura na TAP e persistência
+  - name: histórico
+    description: consulta ao que já foi coletado
+  - name: operação
+    description: liveness e readiness
+
+paths:
+  /api/v1/searches:
+    post:
+      tags: [coleta]
+      summary: Coleta voos e tarifas
+      description: |
+        Captura na TAP, persiste no PostgreSQL e no Redis, e devolve as ofertas
+        ordenadas da mais barata para a mais cara.
+
+        Leva de 3 a 9 segundos: cada chamada consulta o GDS.
+      operationId: createSearch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+            examples:
+              somenteIda:
+                summary: Somente ida
+                value:
+                  origin: LIS
+                  destination: RIO
+                  departureDate: '2026-09-01'
+                  passengers: { adults: 1 }
+                  limit: 10
+              idaEVolta:
+                summary: Ida e volta
+                value:
+                  origin: LIS
+                  destination: RIO
+                  departureDate: '2026-09-01'
+                  returnDate: '2026-09-20'
+                  cabinClass: E
+                  passengers: { adults: 2 }
+      responses:
+        '200':
+          description: Ofertas coletadas
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/UpstreamBlocked' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+
+    get:
+      tags: [histórico]
+      summary: Lista o histórico de buscas
+      operationId: listSearches
+      parameters:
+        - { name: origin, in: query, schema: { type: string, example: LIS } }
+        - { name: destination, in: query, schema: { type: string, example: RIO } }
+        - { name: market, in: query, schema: { type: string, example: PT } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Buscas, da mais recente para a mais antiga
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, count]
+                properties:
+                  count: { type: integer, example: 2 }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SearchSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+
+  /api/v1/searches/{key}:
+    get:
+      tags: [histórico]
+      summary: Uma busca do histórico, com as ofertas
+      operationId: getSearch
+      parameters:
+        - $ref: '#/components/parameters/SearchKey'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Busca encontrada
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [search, offers]
+                properties:
+                  search: { $ref: '#/components/schemas/SearchSummary' }
+                  offers:
+                    type: array
+                    items: { $ref: '#/components/schemas/FlightOffer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/searches/{key}/raw:
+    get:
+      tags: [histórico]
+      summary: Resposta bruta guardada no Redis
+      description: |
+        Sem `body=true` devolve apenas os metadados — a resposta original tem
+        centenas de kilobytes.
+
+        O bruto tem TTL de 7 dias no Redis e o registro tratado não expira, então
+        `404` aqui costuma significar "a busca existe, a captura já não" — e não
+        que a busca seja desconhecida.
+      operationId: getSearchRaw
+      parameters:
+        - $ref: '#/components/parameters/SearchKey'
+        - name: body
+          in: query
+          description: Devolve o JSON original da TAP em vez dos metadados
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: |
+            Metadados do payload; com `body=true`, o JSON original da TAP, cuja
+            forma é a do endpoint que o produziu e não é descrita aqui.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RawMetadata'
+                  - type: object
+                    description: Resposta original da TAP, devolvida com body=true
+                    additionalProperties: true
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/flights:
+    get:
+      tags: [coleta]
+      summary: Coleta voos e tarifas com critérios na query string
+      description: Equivalente a `POST /api/v1/searches`.
+      operationId: getFlights
+      parameters:
+        - { name: origin, in: query, required: true, schema: { type: string, example: LIS } }
+        - { name: destination, in: query, required: true, schema: { type: string, example: RIO } }
+        - name: departureDate
+          in: query
+          required: true
+          schema: { type: string, example: '2026-09-01' }
+        - { name: returnDate, in: query, schema: { type: string, example: '2026-09-20' } }
+        - $ref: '#/components/parameters/CabinClass'
+        - $ref: '#/components/parameters/Adults'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Ofertas coletadas
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/UpstreamBlocked' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+
+  /api/v1/calendar:
+    get:
+      tags: [coleta, histórico]
+      summary: Melhor preço por data de partida
+      description: |
+        Uma requisição à TAP cobre ~365 datas. Lê do banco por padrão; com
+        `refresh=true` coleta antes de responder.
+
+        `tripType=R` devolve a tarifa de **ida e volta**, tipicamente mais
+        barata que a de só ida — nunca some duas pernas `O` para estimá-la.
+      operationId: getCalendar
+      parameters:
+        - { name: origin, in: query, required: true, schema: { type: string, example: LIS } }
+        - { name: destination, in: query, required: true, schema: { type: string, example: RIO } }
+        - name: tripType
+          in: query
+          description: O somente ida, R ida e volta
+          schema: { type: string, enum: [O, R], default: R }
+        - $ref: '#/components/parameters/CabinClass'
+        - $ref: '#/components/parameters/Adults'
+        - { name: from, in: query, schema: { type: string, example: '2026-09-01' } }
+        - { name: to, in: query, schema: { type: string, example: '2026-10-31' } }
+        - $ref: '#/components/parameters/Refresh'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Datas com voo, da mais barata para a mais cara
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/UpstreamBlocked' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+
+  /api/v1/returns:
+    get:
+      tags: [coleta, histórico]
+      summary: Matriz ida × volta
+      description: |
+        Fixada a data de ida, devolve o preço **total** para cada data de
+        retorno (~337 por requisição). `nights` é o eixo natural de análise.
+
+        Com `refresh=true`, `departureDate` passa a ser obrigatório.
+      operationId: getReturns
+      parameters:
+        - { name: origin, in: query, required: true, schema: { type: string, example: LIS } }
+        - { name: destination, in: query, required: true, schema: { type: string, example: RIO } }
+        - name: departureDate
+          in: query
+          description: Data de ida. Obrigatória quando refresh=true.
+          schema: { type: string, example: '2026-09-01' }
+        - $ref: '#/components/parameters/CabinClass'
+        - $ref: '#/components/parameters/Adults'
+        - { name: minNights, in: query, schema: { type: integer, minimum: 0, example: 7 } }
+        - { name: maxNights, in: query, schema: { type: integer, minimum: 0, example: 21 } }
+        - $ref: '#/components/parameters/Refresh'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Combinações, da mais barata para a mais cara
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReturnsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/UpstreamBlocked' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+
+  /health:
+    get:
+      tags: [operação]
+      summary: Liveness
+      operationId: health
+      responses:
+        '200':
+          description: O processo está de pé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /health/ready:
+    get:
+      tags: [operação]
+      summary: Readiness
+      description: Verifica PostgreSQL e Redis.
+      operationId: ready
+      responses:
+        '200':
+          description: Dependências respondendo
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Alguma dependência indisponível
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+components:
+  parameters:
+    SearchKey:
+      name: key
+      in: path
+      required: true
+      description: Chave canônica da busca
+      schema:
+        type: string
+        example: search:LIS:RIO:01092026:OW:E:PT:1
+    Limit:
+      name: limit
+      in: query
+      description: Máximo de itens (teto de 1000)
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 50 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    CabinClass:
+      name: cabinClass
+      in: query
+      description: E economy, W premium, C executiva
+      schema: { type: string, enum: [E, W, C], default: E }
+    Refresh:
+      name: refresh
+      in: query
+      description: |
+        Coleta na TAP antes de responder. Lento — consulta o GDS.
+
+        Aceita qualquer booleano (`true`, `1`, `t`). Um valor que não seja
+        booleano é 400, não um `false` implícito.
+      schema: { type: boolean, default: false }
+    Adults:
+      name: adults
+      in: query
+      description: |
+        Número de adultos. **Faz parte da identidade da série de preços**, não é
+        só um filtro: o total para 1 e para 2 passageiros são valores diferentes
+        para a mesma data, coletados e guardados em separado. Uma consulta com
+        `adults` diferente do que foi coletado devolve lista vazia, não o preço
+        de outra contagem.
+      schema: { type: integer, minimum: 1, default: 1 }
+
+  responses:
+    BadRequest:
+      description: Parâmetros inválidos
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            status: 400
+            code: bad_request
+            detail: 'requisição inválida: origin é obrigatório'
+    NotFound:
+      description: Registro não encontrado
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UpstreamBlocked:
+      description: |
+        A TAP recusou a requisição. Não é erro do cliente: normalmente o WAF da
+        Cloudflare, que bloqueia perfis TLS da família Chromium.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            status: 502
+            code: upstream_blocked
+            detail: 'acesso negado pelo WAF da TAP: HTTP 403'
+    GatewayTimeout:
+      description: A TAP não respondeu no tempo limite
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: |
+        A TAP recusou por excesso de requisições. O scraper já limita a taxa
+        (0,5 req/s por padrão); reduza a concorrência antes de insistir.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            status: 429
+            code: upstream_rate_limited
+            detail: 'limite de requisições atingido: HTTP 429'
+    MethodNotAllowed:
+      description: Método não suportado nesta rota; o cabeçalho Allow lista os que são
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            status: 405
+            code: method_not_allowed
+            detail: 'use GET, POST'
+
+  schemas:
+    Problem:
+      type: object
+      required: [status, code, detail]
+      properties:
+        status: { type: integer, example: 400 }
+        code:
+          type: string
+          description: Identificador estável, adequado para lógica no cliente
+          enum:
+            - bad_request
+            - not_found
+            - method_not_allowed
+            - upstream_blocked
+            - upstream_rate_limited
+            - upstream_unauthorized
+            - upstream_invalid_response
+            - upstream_timeout
+            - client_closed_request
+            - internal_error
+        detail: { type: string }
+
+    Passengers:
+      type: object
+      properties:
+        adults: { type: integer, minimum: 1, default: 1 }
+        youths: { type: integer, minimum: 0 }
+        children: { type: integer, minimum: 0 }
+        infants: { type: integer, minimum: 0 }
+
+    SearchRequest:
+      type: object
+      required: [origin, destination, departureDate]
+      properties:
+        origin:
+          type: string
+          description: Código IATA de aeroporto ou de cidade
+          example: LIS
+        destination: { type: string, example: RIO }
+        departureDate:
+          type: string
+          description: 'Aceita AAAA-MM-DD, DD/MM/AAAA, DD-MM-AAAA ou DDMMAAAA'
+          example: '2026-09-01'
+        returnDate: { type: string, example: '2026-09-20' }
+        cabinClass: { type: string, enum: [E, W, C], default: E }
+        passengers: { $ref: '#/components/schemas/Passengers' }
+        limit: { type: integer, minimum: 1 }
+
+    SearchSummary:
+      type: object
+      properties:
+        searchKey: { type: string }
+        origin: { type: string, example: LIS }
+        destination: { type: string, example: RIO }
+        departDate: { type: string, format: date-time }
+        returnDate: { type: [string, 'null'], format: date-time }
+        cabinClass: { type: string, example: E }
+        market: { type: string, example: PT }
+        adults: { type: integer, example: 1 }
+        currency: { type: [string, 'null'], example: EUR }
+        officeId: { type: [string, 'null'], example: LISTP08AB }
+        totalOffers: { type: integer, example: 105 }
+        rawKey:
+          type: [string, 'null']
+          description: Chave da resposta bruta no Redis
+        scrapedAt: { type: string, format: date-time }
+
+    FlightOffer:
+      type: object
+      description: |
+        Uma tarifa com o itinerário resolvido. Os horários são hora local do
+        aeroporto: use durationMinutes, não a diferença entre eles.
+      properties:
+        offerId: { type: integer, example: 1 }
+        flightId: { type: integer, example: 1 }
+        route: { type: string, example: LIS-GIG }
+        flightNumbers:
+          type: array
+          items: { type: string }
+          example: [TP71]
+        departureTime:
+          type: [string, 'null']
+          format: date-time
+          description: Hora local do aeroporto de origem
+        arrivalTime:
+          type: [string, 'null']
+          format: date-time
+          description: Hora local do aeroporto de destino
+        durationMinutes:
+          type: integer
+          description: Vem da TAP. É a única fonte confiável de duração.
+          example: 595
+        numberOfStops: { type: integer, example: 0 }
+        cabin: { type: [string, 'null'], example: M }
+        fareFamily: { type: [string, 'null'], example: DISCINT }
+        totalPrice: { type: number, example: 615.21 }
+        basePrice: { type: number, example: 324.0 }
+        tax: { type: number, example: 291.21 }
+        currency: { type: string, example: EUR }
+        superSaver: { type: boolean }
+
+    Capture:
+      type: object
+      description: Como a coleta foi feita
+      properties:
+        tlsProfile: { type: string, example: firefox_148 }
+        engine: { type: string, example: gecko }
+        market: { type: string, example: PT }
+        latencyMs: { type: integer, example: 3207 }
+        officeId: { type: string, example: LISTP08AB }
+        flights: { type: integer, example: 34 }
+        offers: { type: integer, example: 105 }
+        rawKey: { type: string }
+        warnings:
+          type: array
+          description: |
+            Falhas de persistência que não invalidaram a captura. É AQUI que os
+            avisos de `/calendar` e `/returns` aparecem — em `POST /searches` eles
+            vêm na raiz da resposta, porque lá o `capture` descreve só o
+            fingerprint.
+          items: { type: string }
+
+    SearchResponse:
+      type: object
+      required: [searchKey, search, offers, capture]
+      properties:
+        searchKey: { type: string }
+        search: { $ref: '#/components/schemas/SearchSummary' }
+        offers:
+          type: array
+          items: { $ref: '#/components/schemas/FlightOffer' }
+        capture: { $ref: '#/components/schemas/Capture' }
+        warnings:
+          type: array
+          description: |
+            Falhas de persistência que não invalidaram a captura. O dado custou
+            uma consulta ao GDS: descartá-lo por um Redis fora do ar seria pior.
+          items: { type: string }
+
+    CalendarEntry:
+      type: object
+      properties:
+        departureAirport: { type: string, example: LIS }
+        arrivalAirport: { type: string, example: GIG }
+        departureDate: { type: string, format: date-time }
+        cabinClass: { type: string, example: E }
+        tripType: { type: string, enum: [O, R] }
+        adults: { type: integer, example: 1 }
+        currency: { type: string, example: EUR }
+        bestTotalPrice: { type: number, example: 487.21 }
+        monthlyMinimum:
+          type: boolean
+          description: É o menor preço do mês
+        scrapedAt: { type: string, format: date-time }
+
+    CalendarResponse:
+      type: object
+      required: [origin, destination, tripType, adults, dates]
+      properties:
+        origin: { type: string }
+        destination: { type: string }
+        tripType: { type: string, enum: [O, R] }
+        adults:
+          type: integer
+          description: Contagem de passageiros da série devolvida
+          example: 1
+        currency: { type: string, example: EUR }
+        cheapest: { $ref: '#/components/schemas/CalendarEntry' }
+        dates:
+          type: array
+          items: { $ref: '#/components/schemas/CalendarEntry' }
+        capture: { $ref: '#/components/schemas/Capture' }
+
+    ReturnEntry:
+      type: object
+      properties:
+        origin: { type: string, example: LIS }
+        destination: { type: string, example: RIO }
+        resolvedDestination:
+          type: [string, 'null']
+          description: Aeroporto concreto resolvido pela TAP
+          example: GIG
+        departureDate: { type: string, format: date-time }
+        returnDate: { type: string, format: date-time }
+        nights: { type: integer, example: 18 }
+        cabinClass: { type: string, example: E }
+        adults: { type: integer, example: 1 }
+        currency: { type: string, example: EUR }
+        totalPrice:
+          type: number
+          description: Preço total da viagem, não de uma perna
+          example: 445.92
+        directFlight: { type: boolean }
+        scrapedAt: { type: string, format: date-time }
+
+    ReturnsResponse:
+      type: object
+      required: [origin, destination, adults, combinations]
+      properties:
+        origin: { type: string }
+        destination: { type: string }
+        departureDate: { type: string, example: '2026-09-01' }
+        adults:
+          type: integer
+          description: Contagem de passageiros da série devolvida
+          example: 1
+        currency: { type: string, example: EUR }
+        cheapest: { $ref: '#/components/schemas/ReturnEntry' }
+        combinations:
+          type: array
+          items: { $ref: '#/components/schemas/ReturnEntry' }
+        capture: { $ref: '#/components/schemas/Capture' }
+
+    RawMetadata:
+      type: object
+      properties:
+        searchKey: { type: string }
+        rawKey: { type: string }
+        sizeBytes: { type: integer, example: 279289 }
+        hint: { type: string }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+          example: { postgres: ok, redis: ok }

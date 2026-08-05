@@ -1,0 +1,14 @@
+# Cookies de sessão real: contêm cf_clearance atrelado ao IP, nunca versionar.
+cookies.txt
+
+# Binários: um `go build ./cmd/api` deixa o executável no raiz, e são ~24 MB.
+/scraper
+/api
+/tlsprobe
+/wafprobe
+/bin/
+
+# Dumps locais
+/data/
+
+/metricas-e-anotacoes

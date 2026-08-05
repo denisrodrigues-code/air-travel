@@ -1,0 +1,19 @@
+# Cookies copiados de uma sessão real do navegador em booking.flytap.com.
+#
+# Como obter:
+#   1. Abra https://booking.flytap.com/booking no Chrome e faça uma busca.
+#   2. DevTools -> Application -> Cookies -> https://booking.flytap.com
+#   3. Copie os valores abaixo e salve este arquivo como cookies.txt
+#
+# cf_clearance é obrigatório: sem ele a Cloudflare devolve o desafio em vez do
+# JSON da API. Ele está atrelado ao IP e ao fingerprint TLS de quem o obteve,
+# portanto precisa ser recoletado quando o scraper passar a receber HTTP 403.
+
+cf_clearance=COLE_AQUI
+__cf_bm=COLE_AQUI
+
+# Opcionais: aproximam a sessão do scraper de uma sessão real de navegador.
+# httpECX=
+# httpECXCORS=
+# dtCookie=
+# rxVisitor=
