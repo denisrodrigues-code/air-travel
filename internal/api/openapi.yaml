@@ -491,10 +491,33 @@ components:
           type: integer
           description: Vem da TAP. É a única fonte confiável de duração.
           example: 595
-        numberOfStops: { type: integer, example: 0 }
+        numberOfStops:
+          type: integer
+          description: |
+            Conta apenas CONEXÕES. Uma parada técnica não entra aqui — some
+            technicalStops para obter o número de escalas que a TAP anuncia.
+          example: 0
+        technicalStops:
+          type: integer
+          description: |
+            Paradas técnicas do itinerário: o avião pousa e decola com o mesmo
+            número de voo, sem conexão. O TP67 LIS-GIG tem numberOfStops 0 e
+            uma parada técnica de 105 min em Curitiba, e é o que explica as
+            14h15 dele contra as 9h55 dos diretos da mesma rota.
+          example: 0
         cabin: { type: [string, 'null'], example: M }
         fareFamily: { type: [string, 'null'], example: DISCINT }
-        totalPrice: { type: number, example: 615.21 }
+        totalPrice:
+          type: number
+          description: Total da VIAGEM (ida + volta, quando há volta).
+          example: 1305.10
+        outboundPrice:
+          type: [number, 'null']
+          description: |
+            Preço só da perna de ida — é o valor que a TAP exibe nos cartões de
+            voo. Ausente quando a resposta da TAP não trouxe a perna, o que não
+            é o mesmo que custar zero.
+          example: 460.21
         basePrice: { type: number, example: 324.0 }
         tax: { type: number, example: 291.21 }
         currency: { type: string, example: EUR }
@@ -504,13 +527,13 @@ components:
       type: object
       description: Como a coleta foi feita
       properties:
-        tlsProfile: { type: string, example: firefox_148 }
+        tlsProfile: { type: string, example: firefox_135 }
         engine: { type: string, example: gecko }
         market: { type: string, example: PT }
-        latencyMs: { type: integer, example: 3207 }
+        latencyMs: { type: integer, example: 4598 }
         officeId: { type: string, example: LISTP08AB }
         flights: { type: integer, example: 34 }
-        offers: { type: integer, example: 105 }
+        offers: { type: integer, example: 106 }
         rawKey: { type: string }
         warnings:
           type: array

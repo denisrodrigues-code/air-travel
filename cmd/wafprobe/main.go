@@ -23,18 +23,24 @@ import (
 	"strings"
 	"time"
 
+	"airtravel/internal/client"
 	"airtravel/internal/collect"
 	"airtravel/internal/config"
 	"airtravel/internal/models"
 	"airtravel/internal/platform"
 )
 
-// defaultProfiles cobre as três famílias de motor, começando pelas que passam.
-var defaultProfiles = []string{
-	"firefox_148", "firefox_147", "firefox_135",
-	"safari_ios_18_5",
-	"chrome_151", "chrome_146",
-}
+// defaultProfiles é o registro inteiro, não uma seleção.
+//
+// Era uma lista de seis nomes fixos enquanto o registro tinha dezoito, então
+// `./run.sh wafprobe` sem argumentos media um terço dos perfis e calava sobre o
+// resto — inclusive sobre perfis que o -tls-profile aceita. Derivar da fonte
+// impede que as duas voltem a divergir.
+//
+// Atenção ao custo: são 18 requisições mais os dois controles, e o bloqueio por
+// volume do §4 foi observado a partir de ~8. Meça em lotes com -profiles se o
+// controle começar a cair no meio.
+var defaultProfiles = client.ProfileNames()
 
 func main() {
 	if err := run(); err != nil {
@@ -56,10 +62,17 @@ func run() error {
 		delay    = flag.Duration("delay", 4*time.Second, "intervalo entre combinações")
 		rps      = flag.Float64("rps", 2, "requisições por segundo dentro de uma tentativa")
 		verbose  = flag.Bool("verbose", false, "mostrar o log do adapter")
-		control  = flag.String("control", config.DefaultTLSProfile,
-			"perfil de referência, medido antes e depois para atestar a janela; vazio desativa")
+		// "auto" percorre client.PassingProfiles até uma referência passar.
+		//
+		// O padrão NÃO é config.DefaultTLSProfile, e isso é deliberado: herdar o
+		// padrão da aplicação fazia a ferramenta morrer junto com ele. Ver
+		// measureControl.
+		control = flag.String("control", "auto",
+			`perfil de referência: "auto" percorre client.PassingProfiles, um nome força um perfil, vazio desativa`)
 		force = flag.Bool("force", false,
 			"medir mesmo com o controle bloqueado (a tabela resultante não vale nada)")
+		cookiesFile = flag.String("cookies", "",
+			"arquivo de cookies a semear no jar; VAZIO (padrão) mede sem cookie algum")
 	)
 	flag.Parse()
 
@@ -88,10 +101,20 @@ func run() error {
 	ctx := context.Background()
 	opts := attemptOptions{
 		proxyURL: *proxyURL, market: *market, language: *language, rps: *rps,
+		cookiesFile: *cookiesFile,
 	}
 
-	fmt.Printf("%s->%s %s · mercado %s · %d combinação(ões)\n\n",
-		params.Origin, params.Destination, params.DepartDate, *market, len(profiles))
+	// O padrão continua SEM cookies, e isso é a decisão documentada no §4: medir
+	// fingerprint com um jar por trás confunde as duas variáveis. A flag existe
+	// porque a hipótese oposta precisou ser testada em 2026-08-06, quando o
+	// navegador real passava na mesma janela em que todo perfil nosso era recusado
+	// — e a única diferença restante era o jar.
+	jarNote := "sem cookie algum"
+	if *cookiesFile != "" {
+		jarNote = "com o jar de " + *cookiesFile
+	}
+	fmt.Printf("%s->%s %s · mercado %s · %d combinação(ões) · %s\n\n",
+		params.Origin, params.Destination, params.DepartDate, *market, len(profiles), jarNote)
 
 	// O controle vem ANTES de tudo, e é o que dá sentido à tabela.
 	//
@@ -100,29 +123,13 @@ func run() error {
 	// a leitura natural, "o perfil deixou de funcionar", está errada. Foi exatamente
 	// o erro cometido em 2026-08-04. Um perfil de referência recusado significa que
 	// nenhuma linha da tabela quer dizer nada. Ver CLAUDE.md §4.
+	reference := ""
 	if *control != "" {
-		fmt.Printf("controle (%s): ", *control)
-		_, res := attempt(ctx, log, *control, params, opts)
-
-		switch {
-		case res.ok:
-			fmt.Printf("OK — janela limpa, a tabela abaixo é interpretável\n\n")
-		case *force:
-			fmt.Printf("BLOQUEADO — seguindo por -force; A TABELA NÃO VALE NADA\n\n")
-		default:
-			fmt.Printf("BLOQUEADO\n")
-			return fmt.Errorf(`
-o perfil de referência %q foi recusado, então o WAF está recusando tudo agora —
-provavelmente bloqueio por VOLUME, que é temporário e independe de fingerprint.
-
-Medir nesta janela produziria "todos bloqueados" para qualquer perfil, o que se
-confunde com "o perfil deixou de funcionar". Espere alguns minutos (na medição de
-2026-08-04 a janela passou de 16 min) e remeça.
-
-  -force        mede de qualquer forma
-  -control ""   desativa esta checagem`, *control)
+		ref, err := measureControl(ctx, log, controlChain(*control), params, opts, *delay, *force)
+		if err != nil {
+			return err
 		}
-
+		reference = ref
 		time.Sleep(*delay)
 	}
 
@@ -149,11 +156,15 @@ confunde com "o perfil deixou de funcionar". Espere alguns minutos (na medição
 
 	// O controle é remedido no fim: a janela pode ter fechado DURANTE a tabela, e aí
 	// os últimos perfis foram julgados por um bloqueio que não é deles.
+	//
+	// Remede-se a referência que PASSOU no início, não o primeiro nome da cadeia:
+	// se o primeiro estava morto, medi-lo de novo só reconfirmaria que ele está
+	// morto, sem dizer nada sobre a janela.
 	var controlFellDuring bool
-	if *control != "" && len(blocked) > 0 {
+	if reference != "" && len(blocked) > 0 {
 		time.Sleep(*delay)
-		fmt.Printf("\ncontrole (%s), remedido: ", *control)
-		_, res := attempt(ctx, log, *control, params, opts)
+		fmt.Printf("\ncontrole (%s), remedido: ", reference)
+		_, res := attempt(ctx, log, reference, params, opts)
 		if res.ok {
 			fmt.Printf("OK — a janela continuou limpa do começo ao fim\n")
 		} else {
@@ -181,11 +192,108 @@ julgados por isso, e não por fingerprint. Espere e remeça`)
 	return nil
 }
 
+// controlChain devolve os perfis de referência a tentar, em ordem.
+//
+// "auto" (o padrão) usa client.PassingProfiles inteiro. Qualquer outro valor é
+// tratado como um nome único, para poder forçar uma referência específica.
+func controlChain(control string) []string {
+	if control != "auto" {
+		return []string{control}
+	}
+	return client.PassingProfiles
+}
+
+// measureControl estabelece se a janela está aberta, e devolve o perfil de
+// referência que de fato passou.
+//
+// **Por que é uma cadeia e não um perfil.** A versão anterior media UM perfil, e o
+// padrão dele era `config.DefaultTLSProfile`. Isso acoplava a ferramenta ao padrão
+// da aplicação, e em 2026-08-06 o acoplamento cobrou: o padrão era `firefox_148`,
+// que havia deixado de atravessar o WAF. Controle morto ⇒ recusa permanente ⇒ a
+// ferramenta anunciava "provavelmente bloqueio por VOLUME, espere". Custou 38
+// minutos de espera por uma janela que não existia.
+//
+// Com uma cadeia, "controle recusado" deixa de ser uma conclusão e passa a ser uma
+// pergunta que a própria ferramenta responde:
+//
+//   - alguma referência passa  → a janela está aberta. Se não foi a primeira, a
+//     primeira é que envelheceu, e isso é dito — é informação sobre o registro, não
+//     sobre a janela.
+//   - nenhuma passa            → aí sim é condição global, e a recusa de medir se
+//     justifica.
+//
+// O custo extra só aparece quando a primeira falha, que é exatamente quando a
+// informação vale a requisição.
+func measureControl(ctx context.Context, log *slog.Logger, chain []string, params models.SearchParams, opts attemptOptions, delay time.Duration, force bool) (string, error) {
+	var stale []string
+
+	for i, profile := range chain {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+
+		fmt.Printf("controle (%s): ", profile)
+		_, res := attempt(ctx, log, profile, params, opts)
+		if res.ok {
+			fmt.Printf("OK — janela limpa, a tabela abaixo é interpretável\n")
+			if len(stale) > 0 {
+				fmt.Printf("\nAVISO: %s foi recusado e %q passou. A janela está aberta, então\n"+
+					"o problema é do perfil, não do momento: reveja se ele ainda deve constar de\n"+
+					"client.PassingProfiles e de config.DefaultTLSProfile.\n",
+					strings.Join(quoteAll(stale), ", "), profile)
+			}
+			fmt.Println()
+			return profile, nil
+		}
+
+		fmt.Printf("BLOQUEADO\n")
+		stale = append(stale, profile)
+	}
+
+	if force {
+		fmt.Printf("\nseguindo por -force; A TABELA NÃO VALE NADA\n\n")
+		return "", nil
+	}
+
+	// Nenhuma referência passou. Só AQUI a hipótese global se sustenta.
+	subject := fmt.Sprintf("as %d referências (%s) foram TODAS recusadas",
+		len(chain), strings.Join(quoteAll(chain), ", "))
+	if len(chain) == 1 {
+		subject = fmt.Sprintf("a referência %s foi recusada", quoteAll(chain)[0])
+	}
+
+	return "", fmt.Errorf(`
+%s, então o WAF está recusando tudo agora.
+
+Duas causas possíveis, e a ferramenta não as distingue:
+
+  1. bloqueio por VOLUME — temporário, independe de fingerprint. Espere alguns
+     minutos (as janelas medidas foram de 16 a 38 min) e remeça.
+  2. as referências envelheceram todas — nesse caso esperar não resolve, e o que
+     falta é remedir o registro inteiro com -control "".
+
+Medir agora produziria "todos bloqueados" para qualquer perfil, o que se confunde
+com "o perfil deixou de funcionar".
+
+  -control ""              mede sem checagem (use para descobrir novas referências)
+  -force                   mede de qualquer forma
+  -control <perfil>        força uma referência específica`, subject)
+}
+
+func quoteAll(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = fmt.Sprintf("%q", n)
+	}
+	return out
+}
+
 type attemptOptions struct {
-	proxyURL string
-	market   string
-	language string
-	rps      float64
+	proxyURL    string
+	market      string
+	language    string
+	rps         float64
+	cookiesFile string
 }
 
 type outcome struct {
@@ -212,6 +320,12 @@ func attempt(ctx context.Context, log *slog.Logger, profile string, params model
 	// chrome_151 faria o adapter trocar para firefox_148 e a tentativa seria
 	// reportada como aprovada — a ferramenta mediria o pool, não o perfil.
 	cfg.Rotate = false
+
+	if opts.cookiesFile != "" {
+		if err := cfg.LoadCookiesFile(opts.cookiesFile); err != nil {
+			return "?", outcome{text: "erro ao ler cookies: " + firstLine(err.Error())}
+		}
+	}
 
 	// Uma função só monta o caminho até a TAP, compartilhada com a aplicação. Uma
 	// segunda cópia aqui deixaria a sondagem medir uma coisa e a aplicação enviar

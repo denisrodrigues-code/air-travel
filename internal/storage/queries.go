@@ -116,13 +116,20 @@ type FlightOffer struct {
 	ArrivalTime     *time.Time `json:"arrivalTime,omitempty"`
 	DurationMinutes int        `json:"durationMinutes"`
 	NumberOfStops   int        `json:"numberOfStops"`
-	Cabin           *string    `json:"cabin,omitempty"`
-	FareFamily      *string    `json:"fareFamily,omitempty"`
-	TotalPrice      float64    `json:"totalPrice"`
-	BasePrice       float64    `json:"basePrice"`
-	Tax             float64    `json:"tax"`
-	Currency        string     `json:"currency"`
-	SuperSaver      bool       `json:"superSaver"`
+	// TechnicalStops conta as paradas técnicas do itinerário, que NÃO estão em
+	// NumberOfStops: a TAP conta ali apenas conexões. Somados, dão o número de
+	// escalas que o site anuncia ao usuário.
+	TechnicalStops int     `json:"technicalStops"`
+	Cabin          *string `json:"cabin,omitempty"`
+	FareFamily     *string `json:"fareFamily,omitempty"`
+	TotalPrice     float64 `json:"totalPrice"`
+	// OutboundPrice é o preço só da perna de ida — o valor que a TAP exibe.
+	// TotalPrice é a viagem inteira. Nulo quando a resposta não trouxe a perna.
+	OutboundPrice *float64 `json:"outboundPrice,omitempty"`
+	BasePrice     float64  `json:"basePrice"`
+	Tax           float64  `json:"tax"`
+	Currency      string   `json:"currency"`
+	SuperSaver    bool     `json:"superSaver"`
 }
 
 // ListFlightOffers devolve as ofertas de uma busca, da mais barata para a mais
@@ -134,7 +141,10 @@ func (p *Postgres) ListFlightOffers(ctx context.Context, searchKey string, limit
 		          FROM segments s
 		         WHERE s.search_key = o.search_key AND s.flight_id = o.flight_id),
 		       f.departure_time, f.arrival_time, f.duration_minutes, f.number_of_stops,
-		       o.cabin, o.fare_family, o.total_price, o.base_price, o.tax,
+		       (SELECT count(*)
+		          FROM technical_stops t
+		         WHERE t.search_key = o.search_key AND t.flight_id = o.flight_id),
+		       o.cabin, o.fare_family, o.total_price, o.outbound_price, o.base_price, o.tax,
 		       o.currency, o.super_saver
 		FROM offers o
 		JOIN flights f ON f.search_key = o.search_key AND f.flight_id = o.flight_id
@@ -153,7 +163,8 @@ func (p *Postgres) ListFlightOffers(ctx context.Context, searchKey string, limit
 		var o FlightOffer
 		if err := rows.Scan(&o.OfferID, &o.FlightID, &o.Route, &o.FlightNumbers,
 			&o.DepartureTime, &o.ArrivalTime, &o.DurationMinutes, &o.NumberOfStops,
-			&o.Cabin, &o.FareFamily, &o.TotalPrice, &o.BasePrice, &o.Tax,
+			&o.TechnicalStops,
+			&o.Cabin, &o.FareFamily, &o.TotalPrice, &o.OutboundPrice, &o.BasePrice, &o.Tax,
 			&o.Currency, &o.SuperSaver); err != nil {
 			return nil, fmt.Errorf("failed to scan flight offer: %w", err)
 		}

@@ -217,7 +217,62 @@ type Segment struct {
 	OperationalDisclosure json.RawMessage            `json:"operationalDisclosure"`
 	Status                json.RawMessage            `json:"status"`
 	StopTime              int                        `json:"stopTime"` // minutos de conexão
-	TechnicalStops        json.RawMessage            `json:"technicalStops"`
+	TechnicalStops        []TechnicalStop            `json:"technicalStops"`
+}
+
+// TechnicalStop é uma parada técnica: o avião pousa e volta a decolar com o
+// MESMO número de voo, então não há conexão nem troca de aeronave.
+//
+// Está aqui, e não em Flight.NumberOfStops, que conta apenas conexões. É por
+// isso que um voo com numberOfStops == 0 aparece no site como "1 escala":
+// verificado no TP67 LIS→GIG de 01/09/2026, que para 105 min em Curitiba e leva
+// 14h15 contra as 9h55 dos diretos da mesma rota. Ignorar este campo faz a
+// coleta contradizer a interface da TAP sem estar errada — que é o pior tipo de
+// divergência, porque parece bug de parsing.
+//
+// Vem null na maioria dos segmentos (64 dos 65 da fixture), daí o slice nil.
+type TechnicalStop struct {
+	ArrivalDate   string `json:"arrivalDate"`   // DD/MM/AAAA
+	ArrivalTime   string `json:"arrivalTime"`   // HH:MM
+	DepartureDate string `json:"departureDate"` // DD/MM/AAAA
+	DepartureTime string `json:"departureTime"` // HH:MM
+	Duration      int    `json:"duration"`      // minutos em solo
+	Location      string `json:"location"`      // código IATA da escala
+}
+
+// StopWallClockLayout combina data e hora de uma parada técnica.
+//
+// Formato próprio: DD/MM/AAAA e HH:MM em campos separados, diferente do
+// RFC3339-com-Z-falso dos segmentos e do CalendarDateLayout do calendário. São
+// três formatos de data na mesma API.
+const StopWallClockLayout = "02/01/2006 15:04"
+
+// ArrivalAt devolve a chegada à escala como hora de parede do aeroporto dela.
+//
+// Vale a mesma regra dos segmentos: não há fuso no valor e não se deve subtrair
+// dois instantes para obter duração — o campo Duration já a traz.
+func (s TechnicalStop) ArrivalAt() (time.Time, error) {
+	return parseStopWallClock(s.ArrivalDate, s.ArrivalTime)
+}
+
+// DepartureAt devolve a saída da escala como hora de parede do aeroporto dela.
+func (s TechnicalStop) DepartureAt() (time.Time, error) {
+	return parseStopWallClock(s.DepartureDate, s.DepartureTime)
+}
+
+// parseStopWallClock junta data e hora. Devolve o zero sem erro quando qualquer
+// das duas falta: uma escala sem horário anunciado é ausência de informação, não
+// resposta malformada, e derrubar a gravação de uma busca inteira por causa
+// disso seria desproporcional. Já um valor presente e ilegível é erro.
+func parseStopWallClock(date, clock string) (time.Time, error) {
+	if date == "" || clock == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(StopWallClockLayout, date+" "+clock)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse technical stop %q %q: %w", date, clock, err)
+	}
+	return t, nil
 }
 
 // DepartureTime devolve a hora de parede da partida, no fuso do aeroporto de

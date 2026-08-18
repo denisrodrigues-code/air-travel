@@ -16,6 +16,11 @@ import (
 // origem, destino, número do voo, horários e valor.
 //
 // As ofertas são ordenadas por preço crescente; limit <= 0 imprime todas.
+//
+// As colunas IDA e TOTAL são separadas de propósito. A TAP exibe ao usuário o
+// preço da PERNA DE IDA, e uma tabela com uma coluna só de preço parecia
+// contradizê-la: 1.305,10 aqui contra 460,21 na tela, para a mesma oferta.
+// Nenhum dos dois estava errado — faltava dizer qual era qual.
 func PrintOffers(w io.Writer, records []models.OfferRecord, limit int) error {
 	if len(records) == 0 {
 		if _, err := fmt.Fprintln(w, "Nenhuma oferta encontrada."); err != nil {
@@ -40,19 +45,20 @@ func PrintOffers(w io.Writer, records []models.OfferRecord, limit int) error {
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ROTA\tVOOS\tPARTIDA\tCHEGADA\tDURAÇÃO\tPARADAS\tCABINE\tTARIFA\tVALOR")
-	fmt.Fprintln(tw, "----\t----\t-------\t-------\t-------\t-------\t------\t------\t-----")
+	fmt.Fprintln(tw, "ROTA\tVOOS\tPARTIDA\tCHEGADA\tDURAÇÃO\tPARADAS\tCABINE\tTARIFA\tIDA\tTOTAL")
+	fmt.Fprintln(tw, "----\t----\t-------\t-------\t-------\t-------\t------\t------\t---\t-----")
 
 	for _, rec := range sorted {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%.2f %s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.2f %s\n",
 			rec.RouteString(),
 			strings.Join(rec.FlightNumbers, "+"),
 			formatTime(rec.DepartureTime),
 			formatTime(rec.ArrivalTime),
 			formatDuration(rec.DurationMin),
-			rec.NumberOfStops,
+			formatStops(rec.NumberOfStops, rec.TechnicalStops),
 			rec.Cabin,
 			rec.FareFamily,
+			formatOutbound(rec.OutboundPrice),
 			rec.TotalPrice,
 			rec.Currency,
 		)
@@ -202,4 +208,26 @@ func formatDuration(minutes int) string {
 		return "-"
 	}
 	return fmt.Sprintf("%dh%02dm", minutes/60, minutes%60)
+}
+
+// formatStops junta conexões e paradas técnicas sem somá-las.
+//
+// A TAP conta as duas como "escala" na interface, mas são coisas diferentes:
+// conexão troca de voo, parada técnica não. Somar faria a tabela concordar com o
+// site ao custo de perder a distinção; separar mantém as duas legíveis. O TP67
+// LIS→GIG, que o site anuncia como "1 escala", sai daqui como "0 (+1 téc)".
+func formatStops(connections, technical int) string {
+	if technical <= 0 {
+		return fmt.Sprintf("%d", connections)
+	}
+	return fmt.Sprintf("%d (+%d téc)", connections, technical)
+}
+
+// formatOutbound exibe o preço da perna de ida, ou um travessão quando a
+// resposta não o trouxe — que não é o mesmo que ele ser zero.
+func formatOutbound(price *float64) string {
+	if price == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%.2f", *price)
 }

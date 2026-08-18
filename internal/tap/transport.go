@@ -14,6 +14,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 
 	"airtravel/internal/client"
+	"airtravel/internal/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -90,7 +91,7 @@ func (s *Scraper) doWithRetry(ctx context.Context, method, path string, query ur
 		// transitória, é recusa de identidade, e esperar não muda nada.
 		if errors.Is(err, ErrAccessDenied) || errors.Is(err, ErrCloudflareChallenge) {
 			if !s.fps.Blocked(profile, err) {
-				return nil, s.blockError(err, rotations)
+				return nil, s.blockError(err, rotations, path)
 			}
 			rotations++
 			continue
@@ -107,7 +108,7 @@ func (s *Scraper) doWithRetry(ctx context.Context, method, path string, query ur
 	}
 
 	if rotations > 0 {
-		return nil, s.blockError(lastErr, rotations)
+		return nil, s.blockError(lastErr, rotations, path)
 	}
 	return nil, fmt.Errorf("esgotadas %d tentativas: %w", s.cfg.MaxRetries, lastErr)
 }
@@ -118,7 +119,22 @@ func (s *Scraper) doWithRetry(ctx context.Context, method, path string, query ur
 // é arranjar outro fingerprint. Quando o WAF está recusando todas as famílias de
 // motor — bloqueio por volume — a ação é a oposta: esperar. Trocar de perfil não
 // só não resolve, como queima o pool. Ver client.Pool e CLAUDE.md §4.
-func (s *Scraper) blockError(err error, rotations int) error {
+func (s *Scraper) blockError(err error, rotations int, path string) error {
+	// O estado do jar vem PRIMEIRO, antes do diagnóstico de volume.
+	//
+	// Os dois produzem o mesmo sintoma — todas as combinações recusadas, ~1585 ms
+	// cada — mas pedem ações opostas: jar vencido pede recapturar, volume pede
+	// esperar. E a ordem importa porque o bloqueio por volume é INFERIDO (três
+	// perfis distintos recusados numa janela), enquanto a idade do jar é MEDIDA.
+	// Deixar a inferência falar primeiro foi o que fez a aplicação recomendar
+	// "espere" para um problema que a espera não resolve — em 2026-08-06,
+	// duas vezes: comigo e no log da API. Ver CLAUDE.md §4.
+	if jar := s.clearanceProblem(path); jar != "" {
+		return fmt.Errorf("o WAF recusou a requisição e %s — recapture os cookies de um "+
+			"navegador real na MESMA identidade do perfil TLS em uso (%s/%s); "+
+			"esperar não resolve: %w", jar, s.Profile(), s.Engine().Name, err)
+	}
+
 	if g, ok := s.fps.(globalBlocker); ok && g.GlobalBlockSuspected() {
 		return fmt.Errorf("o WAF recusou todas as combinações tentadas (%d rotações) — "+
 			"parece bloqueio por volume, não por fingerprint: espere antes de repetir, "+
@@ -128,6 +144,38 @@ func (s *Scraper) blockError(err error, rotations int) error {
 		return fmt.Errorf("esgotadas as combinações após %d rotações: %w", rotations, err)
 	}
 	return err
+}
+
+// clearanceProblem descreve o que há de errado com o cf_clearance carregado, ou
+// string vazia se não há nada a apontar.
+//
+// Devolve texto e não um erro porque isto não é uma condição própria: é um
+// qualificador do 403 que o WAF já devolveu. O erro do provedor continua sendo a
+// causa embrulhada.
+func (s *Scraper) clearanceProblem(path string) string {
+	// Só a rota de busca exige clearance. As de calendário responderam 200 a 72
+	// requisições SEM cookie algum em 2026-08-06, na mesma janela em que a busca
+	// recusava tudo (CLAUDE.md §4). Culpar o jar por um bloqueio de calendário
+	// mandaria procurar no lugar errado — exatamente o defeito que esta função
+	// existe para corrigir, só que na direção oposta.
+	if path != pathAvailability {
+		return ""
+	}
+
+	if !s.cfg.HasCookie("cf_clearance") {
+		return "não há cf_clearance no jar"
+	}
+
+	age, ok := s.cfg.ClearanceAge(time.Now())
+	if !ok {
+		// Formato irreconhecível: não se afirma nada sobre a idade.
+		return ""
+	}
+	if age > config.ClearanceTTL {
+		return fmt.Sprintf("o cf_clearance tem %s, acima do limite de %s",
+			age.Round(time.Minute), config.ClearanceTTL)
+	}
+	return ""
 }
 
 // do monta e executa uma requisição isolada, respeitando o rate limit e
@@ -192,7 +240,14 @@ func (s *Scraper) applyHeaders(req *http.Request, e client.Engine, path, token s
 
 	req.Header.Set("user-agent", e.UserAgent)
 	req.Header.Set("accept", "application/json, text/plain, */*")
-	req.Header.Set("accept-language", s.cfg.AcceptLang)
+
+	// O motor pode reduzir a entropia do accept-language: o Brave manda duas
+	// entradas onde o Chrome manda quatro. Vazio usa o valor da configuração.
+	acceptLang := s.cfg.AcceptLang
+	if e.AcceptLang != "" {
+		acceptLang = e.AcceptLang
+	}
+	req.Header.Set("accept-language", acceptLang)
 	req.Header.Set("accept-encoding", "gzip, deflate, br, zstd")
 	req.Header.Set("origin", s.cfg.BaseURL)
 	req.Header.Set("referer", s.cfg.BaseURL+profile.refererPath)
@@ -218,9 +273,13 @@ func (s *Scraper) applyHeaders(req *http.Request, e client.Engine, path, token s
 	}
 
 	// Os cabeçalhos de RUM do Dynatrace são da aplicação, não do motor: a SPA os
-	// envia nas chamadas disparadas da página de resultados, em qualquer
-	// navegador.
-	if profile.dynatrace {
+	// envia nas chamadas disparadas da página de resultados.
+	//
+	// "Em qualquer navegador" era a suposição original, e ela caiu: o capture do
+	// Brave em 2026-08-06 não traz nenhum dos quatro, porque ele bloqueia o script
+	// do Dynatrace como rastreador. Então a condição é dupla — a rota tem de
+	// disparar a telemetria E o navegador tem de deixá-la rodar.
+	if profile.dynatrace && !e.BlocksTrackers {
 		traceparent, tracestate := s.dt.trace()
 		req.Header.Set("x-dtreferer", s.cfg.BaseURL+"/booking")
 		req.Header.Set("x-dtpc", s.dt.dtpc)

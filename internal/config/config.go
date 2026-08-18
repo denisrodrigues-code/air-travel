@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,7 +27,7 @@ const (
 	// Perfis Chromium recebem 403 nessa rota mesmo com o JA4 idêntico ao do
 	// Chrome real: o problema é a coerência entre TLS e client hints, que o
 	// Gecko não tem por não anunciar client hint nenhum.
-	DefaultTLSProfile = "firefox_148"
+	DefaultTLSProfile = "firefox_135"
 )
 
 // Cookie é um par nome/valor preservando a ordem de leitura.
@@ -182,14 +184,131 @@ func (c *Config) RequireClearance() error {
 	return nil
 }
 
+// ClearanceAge devolve há quanto tempo o cf_clearance carregado foi emitido.
+//
+// O valor do cookie embute o instante de emissão em Unix, no segundo campo
+// separado por '-':
+//
+//	t0UZ7BGCUjFYpe9qcVbFTqz05bCQUygavPBpyyNSquA-1786021712-1.2.1.1-zSSdZo3M...
+//	                                            ^^^^^^^^^^
+//
+// ok é falso quando não há cf_clearance ou o formato não traz um timestamp
+// reconhecível — não se inventa idade a partir de um valor que não se entende.
+//
+// Existe porque um jar vencido e um jar ausente produzem o MESMO 403, e a ação
+// para os dois é a mesma (recapturar), mas ambos são diferentes de "bloqueio por
+// volume", cuja ação é esperar. Sem medir a idade, o diagnóstico não consegue
+// separar os três casos — e foi o que fez a aplicação recomendar "espere" para um
+// problema que a espera não resolve. Ver CLAUDE.md §4 e MEDICOES-PERFIS.md.
+func (c *Config) ClearanceAge(now time.Time) (time.Duration, bool) {
+	i := slices.IndexFunc(c.Cookies, func(k Cookie) bool { return k.Name == "cf_clearance" })
+	if i < 0 {
+		return 0, false
+	}
+
+	parts := strings.Split(c.Cookies[i].Value, "-")
+	if len(parts) < 2 {
+		return 0, false
+	}
+	issued, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || issued <= 0 {
+		return 0, false
+	}
+	return now.Sub(time.Unix(issued, 0)), true
+}
+
+// ClearanceTTL é a idade a partir da qual se considera o jar vencido.
+//
+// É uma ESCOLHA, e ela NÃO é calibrável com precisão — as medições de 2026-08-06
+// não concordam entre si:
+//
+//	jar de Chrome    3 min ✅ · 17 min ✅ · 87 min 🔴
+//	jar de Brave    83 s  ✅ ·  2 min ✅ · ~16 min 🔴 · ~24 min 🔴
+//
+// Um jar valeu aos 17 minutos e outro já não valia aos 16. Logo a idade **não é a
+// única variável**: o volume de requisições, ou o número de usos do próprio
+// clearance, entra na conta. Não existe um TTL que descreva os dois casos, e a
+// primeira versão desta constante (30 min, do TTL documentado do `__cf_bm`) foi
+// calibrada com apenas o jar de Chrome — que era metade dos dados.
+//
+// Daí o valor servir a um propósito modesto: fazer o diagnóstico dizer "talvez o
+// jar esteja velho" em vez de "espere por uma janela de volume". Ele não promete
+// validade e não deve ser lido como se prometesse.
+//
+// Errar para o lado CURTO é de propósito, e é o que decidiu os 15 minutos: o custo
+// de sugerir recaptura para um jar ainda válido é uma linha a mais na mensagem de
+// um 403 que já aconteceu; o custo de calar é mandar esperar por algo que a espera
+// não resolve.
+const ClearanceTTL = 15 * time.Minute
+
 // HasCookie informa se um cookie foi carregado.
 func (c *Config) HasCookie(name string) bool {
 	return slices.ContainsFunc(c.Cookies, func(k Cookie) bool { return k.Name == name })
 }
 
-// LoadCookiesFile lê um arquivo de cookies no formato "nome=valor" por linha.
-// Linhas vazias e iniciadas por '#' são ignoradas. É o caminho prático para
-// transferir cf_clearance/__cf_bm de um navegador real para o scraper.
+// cookiePairStart casa o início de um par nome=valor: começo da linha ou um
+// separador (';' ou espaço) seguido de um nome e do '='.
+//
+// Reconhecer o INÍCIO dos pares, em vez de cortar a linha pelos separadores,
+// é o que preserva valores que contêm o próprio separador — e eles existem no
+// jar da TAP: `OptanonConsent` traz '=' e '&' no valor, e os identificadores do
+// Adobe terminam em '=' de padding base64. Um `strings.Split(text, ";")`
+// seguido de `Cut` funcionaria para esses dois, mas o nome é a parte que não
+// pode conter ';', espaço ou '=' — então é nele que a âncora é confiável.
+var cookiePairStart = regexp.MustCompile(`(?:^|[;\s])([^;\s=]+)=`)
+
+// splitCookiePairs extrai os pares de uma linha, que pode conter um só ou vários.
+//
+// Devolve vazio quando a linha não tem nenhum par, e é assim que o chamador
+// detecta linha malformada.
+//
+// Ambiguidade assumida: um valor que contenha um espaço seguido de algo na
+// forma `nome=` é lido como dois cookies. Não há como distinguir os dois casos
+// sem saber de antemão qual formato o arquivo usa, e o cabeçalho Cookie real
+// não põe espaço dentro de valor — então o caso que se escolhe atender é o que
+// de fato acontece.
+func splitCookiePairs(line string) []Cookie {
+	matches := cookiePairStart.FindAllStringSubmatchIndex(line, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	pairs := make([]Cookie, 0, len(matches))
+	for i, m := range matches {
+		// O valor vai do fim deste match (logo após o '=') até o início do
+		// próximo, que já começa no separador — ou até o fim da linha.
+		end := len(line)
+		if i+1 < len(matches) {
+			end = matches[i+1][0]
+		}
+		pairs = append(pairs, Cookie{
+			Name:  line[m[2]:m[3]],
+			Value: strings.TrimRight(line[m[1]:end], "; \t"),
+		})
+	}
+	return pairs
+}
+
+// LoadCookiesFile lê um arquivo de cookies. É o caminho prático para transferir
+// cf_clearance/__cf_bm de um navegador real para o scraper.
+//
+// Aceita as DUAS formas em que um jar sai de um navegador, na mesma linha ou
+// espalhadas pelo arquivo:
+//
+//	cf_clearance=abc          um par por linha
+//	__cf_bm=def
+//
+//	cf_clearance=abc; __cf_bm=def      o formato do cabeçalho Cookie, que é o
+//	cf_clearance=abc __cf_bm=def       que sai do "copy" do DevTools
+//
+// Linhas vazias e iniciadas por '#' são ignoradas.
+//
+// Aceitar a linha única não é conveniência: o formato antigo cortava no
+// PRIMEIRO '=' da linha inteira, então um jar colado do navegador virava UM
+// cookie — nome `_vwo_uuid_v2`, valor todo o resto — e o cf_clearance nunca
+// chegava ao fio. Silenciosamente: quem carregasse o arquivo veria 1 cookie
+// carregado e nenhum erro. Custou uma medição inteira do wafprobe, que anunciou
+// "com o jar de ..." e mediu sem jar nenhum.
 //
 // A ausência do arquivo não é erro: devolve ErrCookiesFileMissing, que o
 // chamador trata conforme o modo. Assim os modos calendar e returns rodam sem
@@ -211,14 +330,11 @@ func (c *Config) LoadCookiesFile(path string) error {
 		if text == "" || strings.HasPrefix(text, "#") {
 			continue
 		}
-		name, value, ok := strings.Cut(text, "=")
-		if !ok {
+		pairs := splitCookiePairs(text)
+		if len(pairs) == 0 {
 			return fmt.Errorf("cookies file %q linha %d: esperado 'nome=valor'", path, line)
 		}
-		c.Cookies = append(c.Cookies, Cookie{
-			Name:  strings.TrimSpace(name),
-			Value: strings.TrimSpace(value),
-		})
+		c.Cookies = append(c.Cookies, pairs...)
 	}
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("failed to read cookies file %q: %w", path, err)

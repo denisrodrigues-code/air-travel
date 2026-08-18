@@ -26,7 +26,7 @@ quem tem `make` — o WSL costuma não trazer):
 
 ```bash
 ./run.sh up          # PostgreSQL 17 + Redis 7, espera ficarem saudáveis
-./run.sh test        # 185 testes contra as fixtures, offline
+./run.sh test        # 210 testes contra as fixtures, offline
 ./run.sh calendar    # melhor preço por data de partida
 ./run.sh returns     # matriz ida x volta
 ./run.sh queries     # o que foi coletado, via SQL (queries.sql)
@@ -140,10 +140,14 @@ menor risco de desaparecer — está registrada aqui para servir de alternativa.
 
 **`tripType` muda o preço, não só o formato:**
 
-| tripType | significado | LIS→RIO, set–out/2026 |
+| tripType | significado | LIS→RIO, set–out/2026 (medido em 05/08/2026) |
 |---|---|---|
-| `O` | só ida | menor 615,21 € · média 643,84 € |
-| `R` | **ida e volta** | menor **487,21 €** · média 552,15 € |
+| `O` | só ida | menor 566,21 € · média 603,39 € |
+| `R` | **ida e volta** | menor **460,21 €** · média 526,90 € |
+
+> Os valores absolutos mudam todo dia — em 03/08 esta mesma tabela dizia 615,21 e
+> 487,21. O que **não** muda é a relação: `R` sai abaixo de `O` na mesma data. É
+> a relação que importa aqui, não o número.
 
 Com `R` a API devolve a **tarifa de ida e volta**, mais barata que a soma de duas
 de só ida — nunca somar duas pernas `O` para estimar um round-trip. A data de
@@ -212,7 +216,8 @@ reordenar. Particularidades fiéis à captura:
 ### Mercado define moeda E tarifas
 
 `market` não é escolha de moeda: é o conjunto tarifário. LIS→RIO ida e volta,
-economy, medido no mesmo dia:
+economy, os dois mercados medidos **no mesmo dia** — 04/08/2026, e é a
+simultaneidade que dá sentido à comparação, não os valores em si:
 
 | market | moeda | menor | datas com voo | data mais barata |
 |---|---|---|---|---|
@@ -238,6 +243,8 @@ Envelope: `{"status":"200","errors":[],"data":{…},"translate":{…}}`.
 | `data.listOutbound[]` | itinerários de ida (34 na amostra) |
 | `data.listOutbound[].listSegment[]` | trechos, com `carrier`+`flightNumber`, datas RFC3339 |
 | `data.offers.listOffers[]` | ofertas/tarifas (105 na amostra) |
+| `data.offers.listOffers[].totalPrice.price` | total da **viagem** (ida + volta) |
+| `data.offers.listOffers[].outbound.totalPrice.price` | preço só da **ida** — é o que a TAP exibe |
 | `data.offers.listOffers[].groupFlights[].idOutBound` | **liga oferta → `listOutbound[].idFlight`** |
 | `data.outPanel.listTab[]` | calendário de datas vizinhas com preço mínimo |
 | `data.offerMatrix.listTab[]` | matriz ida×volta (`offerBean` tem a forma de `Offer`) |
@@ -285,10 +292,36 @@ Estas decisões vieram de erro real, não de palpite. **Não "simplificar".**
 7. `errors` vem `[]` num endpoint e `null` noutro → `json.RawMessage`.
 8. Campos observados só como `null` usam `json.RawMessage`: preserva o valor e
    não arrisca erro de unmarshal quando a API passar a preenchê-los.
+9. **`technicalStops` é um terceiro formato de data**, em campos separados:
+   `arrivalDate` `"01/09/2026"` e `arrivalTime` `"19:55"` → junte com
+   `models.StopWallClockLayout` (`02/01/2006 15:04`). Vale a mesma regra do item
+   4: é hora de parede do aeroporto da escala. Não confundir com o RFC3339 dos
+   segmentos nem com o `CalendarDateLayout` do calendário — **são três formatos
+   de data na mesma API**.
 
 `TestNoUnknownFields` usa `DisallowUnknownFields` e **passa** — o modelo cobre
 100% dos campos da resposta real. Se falhar, a API mudou ou há informação nova
 para aproveitar.
+
+### A armadilha que não é de tipo, e por isso escapou
+
+Um campo pode estar corretamente desserializado e ainda assim fazer a coleta
+**contradizer a interface da TAP**. Duas ocorrências, ambas encontradas em
+05/08/2026 comparando a coleta com prints do site, nenhuma delas procurada:
+
+- **`numberOfStops` conta só conexões.** O TP67 LIS→GIG tem `numberOfStops: 0`,
+  e o site anuncia **"1 escala"** — a diferença está em `technicalStops`, uma
+  parada técnica de 105 min em Curitiba (mesmo número de voo, sem troca de
+  aeronave). É o que explica as 14h15 dele contra as 9h55 dos diretos da mesma
+  rota. O campo era `json.RawMessage` e não chegava ao banco.
+- **A TAP exibe o preço da PERNA DE IDA, não o da viagem.** O cartão de voo diz
+  "Economy 460,21 EUR"; a mesma oferta tem `totalPrice.price` de **1.305,10**,
+  que é ida + volta. Só o total era gravado, então o número que o usuário vê na
+  tela era impossível de reproduzir a partir do PostgreSQL.
+
+A lição de método: `TestNoUnknownFields` prova que **modelamos** todo campo, não
+que **usamos** o campo certo. A checagem que pega esta classe de erro é comparar
+a saída com a interface real — foi o que fez as duas aparecerem de uma vez.
 
 ---
 
@@ -299,15 +332,60 @@ Baseline: Chrome 151 real, JA4 `t13d1516h2_8daaf6152771_806a8c22fdea`.
 **O perfil `chrome_151` (nosso, em `internal/client/profile_chrome151.go`)
 reproduz esse JA4 exatamente — verificado.** Use-o: `-tls-profile chrome_151`.
 
-Medições por perfil (via `cmd/tlsprobe`, sondando um SVG estático):
+**Matriz completa dos 17 perfis**, medida em 2026-08-06 via `cmd/tlsprobe` sondando
+um SVG estático. A coluna `search` é a medição sem cookie da §4:
 
-| perfil | JA4 |
-|---|---|
-| `chrome_133`, `_psk` | `t13d1516h3_8daaf6152771_d8a2da3f94cd` (ALPN h3) |
-| `chrome_144`, `_psk` | `t13d1516h2_8daaf6152771_d8a2da3f94cd` |
-| `chrome_146`, `_psk` | `t13d1517h2_8daaf6152771_dcad5a053991` |
-| **`chrome_151` (nosso)** | **`t13d1516h2_8daaf6152771_806a8c22fdea`** ✅ |
-| Chrome 151 real | `t13d1516h2_8daaf6152771_806a8c22fdea` |
+> **O `brave_151` foi REMOVIDO do registro em 07/08/2026 — hoje são 16 perfis.**
+> As menções a ele nesta seção são o registro da medição, que continua válido; ele
+> só não está mais disponível em `-tls-profile`. A razão da remoção está na
+> subseção do Brave, abaixo.
+
+| perfil | JA4 | `search` |
+|---|---|---|
+| `chrome_131` | `t13d1516h2_8daaf6152771_02713d6af862` | 🔴 |
+| `chrome_133`, `_psk` | `t13d1516h2_8daaf6152771_d8a2da3f94cd` | 🔴 |
+| `chrome_144`, `_psk` | `t13d1516h2_8daaf6152771_d8a2da3f94cd` | 🔴 |
+| `chrome_146`, `_psk` | `t13d1517h2_8daaf6152771_dcad5a053991` | 🔴 |
+| **`chrome_151` (nosso)** | **`t13d1516h2_8daaf6152771_806a8c22fdea`** ✅ | 🔴 |
+| **`brave_151` (nosso)** | **`t13d1516h2_8daaf6152771_806a8c22fdea`** ✅ | 🔴 |
+| Chrome 151 real · Brave 151 real | `t13d1516h2_8daaf6152771_806a8c22fdea` | — |
+| `opera_90`, `opera_91` | `t13d1516h2_8daaf6152771_e5627efa2ab1` | 🔴 |
+| **`firefox_135`** | `t13d17**15**h2_**5b57614c22b0**_a54fffd0eb61` | **✅** |
+| `firefox_147` | `t13d17**17**h2_**5b57614c22b0**_68c5a8c2958d` | 🔴 |
+| `firefox_148` | `t13d1917h2_4d8ed5baf28e_3cbfd9057e0d` | 🔴 |
+| `safari_ios_18_0` | `t13d2014h2_a09f3c656075_**14788d8d241b**` | 🔴 |
+| **`safari_ios_18_5`** | `t13d2014h2_a09f3c656075_**e42f34c56612**` | **✅** |
+| **`safari_ios_26_0`** | `t13d2013h2_a09f3c656075_7f0f34a4126d` | **✅** |
+
+Quatro leituras, e as duas últimas são as mais úteis:
+
+- **`chrome_151` e `brave_151` produzem o JA4 do navegador real, verificado na
+  rede.** Os dois compartilham o spec, e o hash confirma o que o teste offline
+  afirmava. É a única paridade completa do projeto.
+- **As variantes `_psk` têm o MESMO JA4 da não-PSK**, nos três pares. O JA4 não
+  distingue `pre_shared_key`; o JA3 sim, e ali eles diferem.
+- **`firefox_135` e `firefox_147` têm o MESMO hash de cifradores**
+  (`5b57614c22b0`) e diferem só na contagem de extensões: **15 contra 17**. Um passa
+  e o outro não. As duas extensões a mais no `147` são `session_ticket` (`0x0023`) e
+  `psk_key_exchange_modes` (`0x002d`) — medido offline.
+- **`safari_ios_18_0` e `safari_ios_18_5` têm os DOIS primeiros componentes
+  idênticos** (`t13d2014h2_a09f3c656075`) e divergem só no terceiro. Offline, a única
+  diferença entre eles é `signature_algorithms`. Um passa e o outro não.
+
+> **Os dois últimos itens são o melhor par experimental do projeto.** São dois pares
+> em que quase tudo é igual e o WAF decide diferente — o handle mais limpo que existe
+> aqui para o critério da rota. Ver a pendência no §10.
+>
+> **A hipótese fácil já morreu:** não é o `0x0203` (ECDSA-SHA1). O `safari_ios_18_0`
+> o anuncia e falha, mas o `firefox_135` **também o anuncia e passa**, enquanto o
+> `firefox_147` **não** o anuncia e falha. Nenhuma direção se sustenta.
+
+> **Correção de 06/08:** a tabela anterior dava `chrome_133` como
+> `t13d1516h**3**_...` (ALPN com h3). Remedido, ele dá **h2** — é o
+> `WithDisableHttp3()` fazendo efeito, e a medição antiga é de quando aquela opção
+> estava removida por engano (§ Problema 1 do histórico). Consequência: **`chrome_133`
+> e `chrome_144` são hoje indistinguíveis por JA4**, embora seus ClientHellos
+> difiram na ordem das extensões — o JA4 as ordena antes de hashear.
 
 - `chrome_151` = `Chrome_144` + os três algoritmos de assinatura **ML-DSA**
   (`0x0904/0905/0906`) que o Chrome 151 anuncia e nenhum perfil do tls-client
@@ -329,6 +407,235 @@ Medições por perfil (via `cmd/tlsprobe`, sondando um SVG estático):
 > trazem voos. Toda tabela desta seção saiu de uma dessas duas ferramentas, e
 > nenhuma conclusão aqui vale mais que a última medição.
 
+### Os seis perfis acrescentados — e o que a medição offline disse deles
+
+Registrados em 2026-08-06: dois Safari, dois Brave e dois Opera, as versões mais
+recentes que o `tls-client v1.15.1` traz de cada família. Todos medidos nas três
+rotas no mesmo dia. **O `brave_151` foi removido em 07/08** (ver a subseção do
+Brave); os cinco restantes continuam no registro.
+
+| perfil | ClientHello | motor | `search` sem cookie |
+|---|---|---|---|
+| **`safari_ios_26_0`** | novo e distinto | `WebKitIOS26` | ✅ **34 voos** |
+| `safari_ios_18_0` | ⚠️ é o do **Safari 16 (2022)**, não de iOS 18 | `WebKitIOS18` | 🔴 403 |
+| ~~`brave_151`~~ | **é o do Chrome 151** — medido por capture | ~~`BraveChromium151`~~ | 🔴 403 |
+| `opera_91` | Chromium de 2022, igual a `Chrome_103`/`_105` | `OperaChromium105` | 🔴 403 |
+| `opera_90` | idêntico ao `opera_91` | `OperaChromium104` | 🔴 403 |
+
+> **`brave_146` e `brave_146_psk` foram REMOVIDOS do registro** em 06/08, depois de
+> um capture do Brave real. Ver a subseção do Brave abaixo.
+
+**Os seis passam 18/18 nas duas rotas de calendário**, que são as que a coleta de
+fato usa. O 403 acima é só da `search`.
+
+Só o `safari_ios_26_0` entrou em `client.PassingProfiles` — porque foi medido
+passando, duas vezes, sem cookie. `TestPassingProfilesMatchTheMeasurement` guarda a
+lista contra os dois erros que de fato aconteceram ao editá-la (§ abaixo).
+
+### Brave: o ClientHello dele é o do Chrome 151 — e por isso o perfil saiu
+
+> **Removido em 07/08/2026.** Não há mais `brave_151` no registro nem
+> `BraveChromium151` no `engine.go`. O que segue é a medição que justificou primeiro
+> criá-lo e depois dispensá-lo — ela continua valendo, e é o motivo de não valer a
+> pena recriá-lo.
+>
+> O argumento é o desta própria subseção levado ao fim: **o ClientHello do Brave É o
+> do Chrome 151**, então `brave_151` era o spec do `chrome_151` com outra identidade
+> HTTP. E as medições mostraram que essa identidade não muda o resultado — ele passou
+> exatamente onde o `chrome_151` passa (com jar coerente) e falhou onde ele falha
+> (sem cookie). Um perfil a mais no registro que não diversifica o fingerprint TLS
+> nem o veredito do WAF é superfície de manutenção sem contrapartida.
+>
+> O resultado NEGATIVO abaixo — o WAF não confere marca do `sec-ch-ua` nem
+> telemetria contra o clearance — é o que ficou, e está preservado no comentário do
+> `engine.go`.
+
+Capturado com o powhttp em 2026-08-06, e o resultado dispensa os perfis `Brave_*`
+da biblioteca. O Brave 151 real produz:
+
+```
+JA4  t13d1516h2_8daaf6152771_806a8c22fdea    ← idêntico ao Chrome 151 e ao nosso chrome_151
+```
+
+Idêntico na lista crua também: mesmos 15 cifradores, mesmas 16 extensões (`44cd`,
+`fe0d`), mesmos ML-DSA `0904,0905,0906`. O JA3 difere, mas JA3 inclui a **ordem**
+das extensões, que o Chromium embaralha por conexão — ruído, não divergência.
+
+**Confirmado na rede, com o `cf_clearance` legítimo do próprio Brave:**
+
+```
+brave_146       + jar do Brave   🔴 403 · 1602 ms
+brave_146_psk   + jar do Brave   🔴 403 · 1594 ms
+chrome_151      + jar do Brave   ✅ 34 voos · 103 ofertas · 4609 ms
+```
+
+Os perfis da biblioteca reproduzem um navegador que **não existe nessa forma**.
+Foram removidos do registro; `brave_151` usa o spec do `chrome_151` e difere só na
+identidade HTTP.
+
+Quatro divergências medidas contra o Chrome, todas em `BraveChromium151`:
+
+1. `sec-ch-ua` traz `"Brave";v="151"` — **é o único lugar onde a marca aparece**;
+   o User-Agent é byte a byte o do Chrome, de propósito;
+2. `sec-gpc: 1` (Global Privacy Control), que o Chrome não envia;
+3. **nenhum cabeçalho de RUM do Dynatrace** — o Brave bloqueia o script. Daí o
+   campo `Engine.BlocksTrackers`: a condição em `applyHeaders` passou a ser dupla,
+   a rota disparar a telemetria **e** o navegador deixá-la rodar;
+4. `accept-language` reduzido a duas entradas (`Engine.AcceptLang`).
+
+**E a marca GREASE vem PRIMEIRO** no `sec-ch-ua`, nos dois navegadores. O
+`chromiumBrand` a punha no fim, por palpite — o motor `Chromium`, escrito do
+capture, já estava certo, então a divergência ficava só nos motores de marca, onde
+não havia medição. Fixado em `TestGreaseBrandComesFirst`.
+
+> **Resultado NEGATIVO, e é o mais útil daqui.** O `chrome_151` passou com o jar do
+> Brave anunciando `"Google Chrome";v="151"` e **enviando** os quatro cabeçalhos de
+> telemetria que o Brave real não envia. Logo o WAF **não confere a marca do
+> `sec-ch-ua` nem a presença dos cabeçalhos de RUM** contra o clearance. As quatro
+> divergências acima existem por fidelidade ao navegador, não porque a rota as
+> exija — e o espaço de hipóteses do enigma `firefox_135` vs `147`/`148` fica bem
+> menor.
+
+**`brave_151` passa com jar fresco** — remedido com um `cf_clearance` de 83 s,
+controle nas duas pontas:
+
+```
+chrome_151   ✅ 34 voos · 106 ofertas · 4712 ms   ← controle
+brave_151    ✅ 34 voos · 106 ofertas · 4683 ms
+chrome_151   ✅ 34 voos · 106 ofertas · 4542 ms   ← controle remedido
+brave_151    ✅ 34 voos (2ª passada) · 4802 ms
+brave_151    ✅ 34 voos (3ª passada) · 4761 ms
+```
+
+Então as quatro divergências de fidelidade ao Brave **não quebram nada**, e a
+conclusão fecha nos dois sentidos: identidade Brave com jar do Brave passa, e
+identidade Chrome com jar do Brave também. O clearance não é sensível à marca nem à
+telemetria em nenhuma das direções.
+
+Sem cookie, `brave_151` é recusado — como todo Chromium.
+
+> **A primeira tentativa foi inconclusiva, e vale registrar por quê.** O
+> `brave_151` tomou 403, mas o `chrome_151` remedido em seguida **também** — o jar
+> havia morrido. Sem aquele controle ao lado, a leitura óbvia seria "as quatro
+> divergências quebraram algo", e estaria errada. O jar dura pouco: este morreu
+> antes dos 30 min nominais do `__cf_bm`, provavelmente por uso ou pelo volume
+> acumulado da sessão.
+>
+> Nota de método para quem for recapturar: os **dois 403 que o navegador toma** antes
+> de o clearance aparecer são o desafio da Cloudflare, não bloqueio. O `cf_clearance`
+> é emitido logo depois, e o timestamp embutido no valor dele diz a idade — confira
+> antes de medir.
+
+### Opera: inviável, e medido — não mais deduzido
+
+A biblioteca para no Opera 91 = **Chromium 105, de 2022**, e `Opera_89/90/91` são o
+mesmo ClientHello. Qualquer identidade que se anuncie sobre ele é incoerente por
+construção.
+
+**E a medição fechou o caso.** Na passada dos 17 perfis com jar do Brave,
+`opera_90`/`opera_91` tomaram 403 enquanto os **oito Chromium modernos passavam com o
+mesmo token** — família certa, clearance válido, e ainda recusados. Sobra o
+ClientHello. **Falta o perfil, não o jar.**
+
+O mesmo vale para `safari_ios_18_0`, recusado com jar válido: o ClientHello do Safari
+16 sob UA de Safari 18 não passa nem com token.
+
+E o clearance **atravessa variantes de ClientHello dentro da família**: um jar de
+Brave/Chromium 151 destrava `chrome_133`, `_144`, `_146` e as variantes `_psk`, que
+são ClientHellos diferentes entre si. Não é preciso o ClientHello exato de quem
+obteve o token.
+
+### O bloqueio por volume não é global — é por perfil
+
+Refinamento medido em 06/08, ao fim de bem mais de cem requisições do mesmo IP:
+`safari_ios_26_0` falhou nos dois suportes de uma medição enquanto
+`safari_ios_18_5` passava no meio dela. Não é janela fechada — é penalidade que
+atinge os fingerprints mais usados e poupa os outros, na mesma janela e no mesmo IP.
+
+Em 04/08 o fenômeno parecia atingir todos ao mesmo tempo, e é assim que o
+`client.Pool` o detecta (três perfis DISTINTOS recusados em um minuto). A detecção
+continua útil, mas a premissa "atinge todos" descreve um caso, não a regra.
+
+**Consequência prática:** `firefox_135` (o `DefaultTLSProfile`) e `safari_ios_26_0`
+foram recusados sem cookie ao fim da sessão. **Não se reescreveu `PassingProfiles`
+com esse dado** — ele não distingue "degradou como o `147`/`148`" de "esgotei este
+fingerprint hoje". Ver [MEDICOES-PERFIS.md](MEDICOES-PERFIS.md) §6.
+
+Quatro coisas que a medição estabeleceu, e que mudam o que se pode esperar desses
+perfis:
+
+1. **O nome `Safari_IOS_18_0` NÃO descreve o ClientHello dele.** Medido comparando
+   o conteúdo das extensões: ele é idêntico ao `Safari_16_0` e ao `Safari_15_6_1`
+   — o fingerprint do Safari de **2022** — e difere do `Safari_IOS_18_5` em
+   `signature_algorithms` (o 18_0 anuncia `0203`, ECDSA-SHA1; o 18_5 não).
+
+   Então `WebKitIOS18` anuncia Safari 18.0 sobre um ClientHello de Safari 16: a
+   incoerência que o `engine.go` existe para impedir, introduzida por confiar no
+   nome do perfil da biblioteca. **E o WAF viu:** em 06/08, com o mesmo jar,
+   `safari_ios_18_0` tomou 403 enquanto `safari_ios_18_5` e `safari_ios_26_0`
+   trouxeram 34 voos cada. Reproduzido duas vezes.
+
+   **Este é forte candidato a ser removido do registro.** Ficou para o dono do
+   projeto decidir.
+
+   > **Erro de método a não repetir.** A primeira versão desta tabela dizia
+   > "`safari_ios_18_0` é byte a byte idêntico ao `18_5`", e havia um teste verde
+   > afirmando isso. O teste comparava os **tipos** das extensões, não o conteúdo —
+   > então não via a diferença que o servidor vê. `fingerprintOfProfile` em
+   > `profiles_added_test.go` agora compara os bytes, e a relação correta está
+   > fixada. Uma comparação mais barata que a do adversário não mede nada.
+2. **Opera 89, 90 e 91 são um só ClientHello**, e é o do Chromium de 2022 (igual
+   ao `Chrome_103` e ao `Chrome_105`). Vale o mesmo: duas versões, um fingerprint.
+   Por isso os motores anunciam **Chromium 105 e 104**, não 151 — um `Chrome/151`
+   sobre um ClientHello de 2022 é exatamente a incoerência que o `engine.go`
+   existe para impedir. Fixado em `TestAddedProfilesHaveCoherentEngines`.
+3. **`GetClientHelloSpec()` NÃO funciona para o Opera.** Ele devolve `please
+   implement this method`: os perfis herdados (`Opera_89/90/91`,
+   `Chrome_103..109`, `Safari_16_0`) são declarados com
+   `tls.EmptyClientHelloSpecFactory`, um stub que só erra. Em rede eles
+   funcionam porque o `utls` cai em `UTLSIdToSpec`, uma tabela interna que os
+   cobre (`u_parrots.go:3239`). Daí `client.specFor`, que replica esse fallback —
+   sem ele, um teste byte a byte no estilo do `profile_chrome151_test.go` não
+   consegue nem inspecionar o Opera. `TestLegacyProfilesNeedTheFallback` avisa se
+   a biblioteca passar a dar `SpecFactory` a eles.
+4. **O Brave não anuncia `trust_anchors` (`0xca34`)** — a mesma extensão que
+   estraga o JA4 do `chrome_146` frente ao Chrome real. Ele também não é cópia do
+   `Chrome_146`: a ordem das extensões difere. É o que faz o Brave valer registro
+   próprio em vez de apelido.
+
+**Os valores de identidade do Opera são ESCOLHA, não medição.** O mapeamento
+Opera 91 → Chromium 105 vem da correspondência de versões do projeto Opera, e os
+números de build (`OPR/91.0.4516.20`) não foram conferidos contra captura. Antes
+de confiar neles numa rota que discrimina, capture o Opera real. É a lição desta
+seção aplicada ao próprio acréscimo.
+
+### Dois nomes que parecem certos e não são
+
+Ambos foram cometidos ao editar `PassingProfiles` à mão, e agora há teste para os
+dois.
+
+**`"Firefox_135"` com maiúscula derruba a aplicação.** A chave do registro é
+minúscula; `Firefox_135` é o nome da *variável Go* na biblioteca. Como `Rotate` é
+ligado por padrão, o pool falha ao montar e nem o `scraper` nem a `api` sobem:
+
+```
+ERROR execução falhou err="failed to build fingerprint pool: perfil \"Firefox_135\" sem motor associado"
+```
+
+**`safari_ios_18_0` no lugar do `18_5` é o erro silencioso, e o pior.** Um
+caractere de diferença, e o `18_0` é justamente o perfil medido bloqueado. A
+rotação gastaria uma requisição e um 403 nele a cada volta, sem nada indicando o
+motivo.
+
+Para remedir a qualquer momento — **`-control ""` é necessário** se o perfil de
+referência estiver bloqueado, senão a ferramenta se recusa a medir:
+
+```bash
+./run.sh wafprobe                                     # cadeia auto + os 18, sem cookie
+./run.sh wafprobe -control ""                        # sem checagem de referência
+./run.sh wafprobe -control "" -cookies cookies.txt   # os 18, com jar
+```
+
 ### `cmd/tlsprobe`
 
 ```bash
@@ -341,6 +648,30 @@ Sonda um asset estático (não passa pelo WAF), marcando cada requisição com
 
 `cmd/wafprobe` é a outra ferramenta: monta o adapter real com cada perfil e reporta
 quais trazem voos. Use `./run.sh wafprobe`.
+
+### `cmd/routeprobe` — para quando a `search` está fechada
+
+O `wafprobe` só mede a `search`, e ele se recusa a medir dentro da janela de
+bloqueio por volume. Correto — mas "não posso medir a `search` agora" não é "não
+posso medir nada": as rotas de calendário respondem 200 para todos os motores e
+são as que os modos `calendar` e `returns` usam.
+
+```bash
+./run.sh routeprobe                      # todo o registro, rota calendar
+./run.sh routeprobe -routes returns      # todo o registro, calendarReturns
+```
+
+Responde o que o teste offline não pode: se o handshake do perfil funciona de fato
+na rede. Foi assim que se soube que `opera_90`/`opera_91` negociam, apesar de o
+`GetClientHelloSpec()` deles falhar (§4, item 3 dos seis perfis).
+
+**As duas ferramentas derivam a lista de `client.ProfileNames()`.** O
+`defaultProfiles` do `wafprobe` tinha seis nomes fixos contra todos os do
+registro, então `./run.sh wafprobe` media um terço dos perfis e calava sobre o
+resto — inclusive sobre perfis que o `-tls-profile` aceita.
+
+A sessão de medição completa de todo o registro está em
+[MEDICOES-PERFIS.md](MEDICOES-PERFIS.md).
 - **Descompressão é manual:** `Accept-Encoding` é definido à mão, então o fhttp
   não descomprime. `client.DecompressBody` replica o que o wrapper CFFI do
   tls-client faz, com guarda `if !resp.Uncompressed`.
@@ -367,6 +698,74 @@ chrome_146       chromium   BLOQUEADO  WAF HTTP 403
 ```
 
 Sem cookie nenhum. Por isso `DefaultTLSProfile = "firefox_148"`.
+
+> ## ⚠️ REMEDIDA EM 2026-08-07: continua valendo para Chromium, VIROU para os demais
+>
+> **Medição de 07/08, os 16 perfis sem cookie, duas passadas com controle limpo nas
+> duas pontas:**
+>
+> ```
+> firefox_135   gecko   ✅ 33 voos · 94 ofertas · 566,21 EUR · 4825 ms
+> firefox_147   gecko   ✅ 33 voos                            · 4644–4768 ms
+> firefox_148   gecko   ✅ 33 voos                            · 4650–4700 ms
+> os 13 restantes       🔴 403 · 1594–1626 ms
+> ```
+>
+> **A família Gecko passa inteira; os TRÊS WebKit passaram a falhar.** É a inversão
+> exata do quadro de 06/08 reproduzido abaixo: lá passavam `firefox_135`,
+> `safari_ios_18_5` e `safari_ios_26_0`, e os Firefox 147/148 não.
+>
+> Consequências: `PassingProfiles` é hoje os três Gecko, e a conclusão de 06/08 —
+> "o que mudou é por PERFIL, não por família" — **não se sustenta como regra**. Em
+> 07/08 o corte é limpo por família. O que resistiu às três medições é só isto:
+> **nenhum Chromium passa sem cookie**.
+>
+> O bloco abaixo é o registro de 06/08, mantido porque é ele que mostra que este
+> veredito muda em dias — e é a razão de o `wafprobe` existir.
+>
+> ## ✅ A REGRA DE 2026-08-06 — histórico
+>
+> Todo o registro, **sem cookie**, contra esta rota (18 perfis na data desta
+> medição; o registro tem **16** desde a remoção do `brave_151` em 07/08). Três
+> passam, e são Gecko e WebKit; nenhum Chromium passa:
+>
+> ```
+> firefox_135      gecko    ✅ 34 voos · 103 ofertas · 566,21 EUR · 4673–4809 ms
+> safari_ios_18_5  webkit   ✅ 34 voos                            · 4746–4866 ms
+> safari_ios_26_0  webkit   ✅ 34 voos                            · 4747–4857 ms
+> os 15 restantes           🔴 403 · 1577–1775 ms
+> ```
+>
+> Reproduzido em duas passadas. A separação de latências é a mesma: recusa em
+> ~1585 ms, aprovação acima de 4500 ms.
+>
+> **O que mudou é por PERFIL, não por família:** `firefox_147` e `firefox_148`
+> saíram da lista dos que passam. `firefox_135` e `safari_ios_18_5` continuam. Por
+> isso `DefaultTLSProfile` passou de `firefox_148` para **`firefox_135`**.
+>
+> ### O acréscimo: um jar coerente destrava o Chromium
+>
+> Com o `cf_clearance` de um Chrome 151 real capturado no powhttp, **10 dos 18
+> passam** — os três acima mais os sete `chrome_*`. Experimento controlado:
+>
+> | perfil | jar | resultado |
+> |---|---|---|
+> | `chrome_151` | ✗ | 🔴 403 · 1582 ms |
+> | `chrome_151` | ✓ | ✅ 34 voos · 4664 ms |
+> | `firefox_148` | ✓ | 🔴 403 · 1585 ms |
+>
+> Mesmo perfil, mesma janela, única variável o jar. E a terceira linha mostra que
+> **o `cf_clearance` é atrelado à identidade que o obteve**: o mesmo jar num perfil
+> Gecko é recusado.
+>
+> As duas coisas valem ao mesmo tempo: **sem cookie decide a combinação
+> perfil↔motor; com jar coerente os Chromium também passam.**
+>
+> > **Exagero a não repetir.** Este bloco dizia "REFUTADA: o que decide é o cookie,
+> > não o motor". Era um exagero meu: eu havia medido os 18 **só com jar**, e naquela
+> > condição sete Chromium passam. A medição sem jar — a condição em que a aplicação
+> > roda — mostra a regra intacta. Confundi "o cookie destrava o Chromium" com "o
+> > cookie é a única variável". Ver [MEDICOES-PERFIS.md](MEDICOES-PERFIS.md) §7.
 
 **Por que o Chromium falha mesmo com JA4 idêntico ao do Chrome real:** o
 tls-client reproduz o ClientHello, mas o User-Agent e os client hints são
@@ -474,14 +873,29 @@ Medido nas duas direções no mesmo IP e na mesma sessão:
 
 Três conclusões, e a terceira é sobre método:
 
-1. **O cookie não é o fator.** `firefox_148` passa **sem cookie algum**
-   (`wafprobe` nunca os carrega — usa `config.Default()` e não chama
-   `LoadCookiesFile`), e `chrome_151` é recusado **com** `cf_clearance` válido no
-   jar. Quem decide é o motor, como o resto desta seção descreve.
+1. **O cookie não é o fator — para os perfis que passam.** A afirmação original
+   continua correta no essencial, e foi **precisada** em 06/08: três perfis
+   (`firefox_135`, `safari_ios_18_5`, `safari_ios_26_0`) trazem voos **sem cookie
+   algum**, e `wafprobe` nunca os carrega por padrão. O que se aprendeu é o outro
+   lado: um `cf_clearance` **coerente com a identidade** destrava os Chromium, que
+   sem ele são recusados. Então o cookie não é necessário para quem já passa, e é
+   suficiente para quem não passava.
+
+   O `-cookies` do `wafprobe` existe por causa desse experimento. **O padrão segue
+   sem jar**, para a ferramenta continuar medindo fingerprint quando é fingerprint
+   que se quer medir. Ver [MEDICOES-PERFIS.md](MEDICOES-PERFIS.md).
 2. **O bloqueio por volume é temporário e atinge todos os perfis.** Não confundir
    com o bloqueio por motor: este é permanente para Chromium e independe de
    quantas requisições foram feitas. A latência uniforme de ~1585 ms nos seis (vs.
    ~4700 ms de uma busca que passa) é o sinal — recusa antes do GDS.
+
+   **Mas não atinge todas as ROTAS — medido em 2026-08-06.** Com a `search` em
+   bloqueio confirmado (controle `firefox_148` recusado às 09:15 e às 09:41), as
+   rotas `calendar` e `calendarReturns` responderam 200 a **72 requisições
+   seguidas**, do mesmo IP, com os 18 perfis. "Atinge todos os perfis" era a
+   leitura certa do eixo medido em 04/08; o eixo rota ainda não tinha sido
+   testado. Consequência prática: **um bloqueio da `search` não é razão para parar
+   os modos `calendar` e `returns`.** Ver [MEDICOES-PERFIS.md](MEDICOES-PERFIS.md).
 3. **`cmd/wafprobe` dava falso negativo se rodado dentro dessa janela.** Ele mediu
    "os seis bloqueados" e a leitura imediata — "o WAF endureceu, nenhum perfil
    passa" — estava errada; a certa era "estou dentro de um bloqueio temporário".
@@ -510,25 +924,43 @@ escolher a mensagem: "esgotadas as combinações" manda arranjar outro fingerpri
 manda procurar no lugar errado. Fixado em `TestPoolDetectsGlobalBlock` e
 `TestGlobalBlockSaysToWaitNotToRotate`.
 
-**O `wafprobe` mede um controle antes e depois** (`-control`, padrão
-`firefox_148`). Se o perfil de referência é recusado, o comando **não mede**: sai
-com erro explicando que a janela está fechada, em vez de imprimir uma tabela de
-"todos bloqueados" que não quer dizer nada. Se o controle passa no início e falha no
-fim, a tabela sai com aviso de que o bloqueio começou no meio. `-force` mede
-mesmo assim; `-control ""` desliga.
+**O `wafprobe` mede uma CADEIA de controle antes e depois** (`-control`, padrão
+`auto`). Se nenhuma referência passa, o comando **não mede**: sai com erro em vez de
+imprimir uma tabela de "todos bloqueados" que não quer dizer nada. Se o controle
+passa no início e falha no fim, a tabela sai com aviso de que o bloqueio começou no
+meio. `-force` mede mesmo assim; `-control ""` desliga; `-control <perfil>` força uma
+referência específica.
 
-Verificado no cenário real, com o IP bloqueado:
+**Por que é cadeia e não um perfil.** O padrão era `config.DefaultTLSProfile`, o que
+acoplava a ferramenta ao padrão da aplicação — e em 06/08 o acoplamento cobrou: o
+padrão era `firefox_148`, que havia **deixado de passar**. Controle morto ⇒ recusa
+permanente ⇒ a ferramenta anunciava "provavelmente bloqueio por VOLUME, espere".
+Custou 38 minutos de espera por uma janela que não existia.
+
+Com `auto`, "controle recusado" deixa de ser conclusão e passa a ser pergunta que a
+própria ferramenta responde, percorrendo `client.PassingProfiles`:
+
+- **alguma referência passa** → a janela está aberta. Se não foi a primeira, o
+  problema é *daquele perfil*, e isso é dito;
+- **nenhuma passa** → só aí a hipótese global se sustenta, e a recusa se justifica.
+
+O custo extra só aparece quando a primeira falha — que é exatamente quando a
+informação vale a requisição.
+
+Verificado introduzindo uma referência morta de propósito no topo da cadeia:
 
 ```
 controle (firefox_148): BLOQUEADO
+controle (firefox_135): OK — janela limpa, a tabela abaixo é interpretável
 
-o perfil de referência "firefox_148" foi recusado, então o WAF está recusando tudo
-agora — provavelmente bloqueio por VOLUME, que é temporário e independe de
-fingerprint.
+AVISO: "firefox_148" foi recusado e "firefox_135" passou. A janela está aberta, então
+o problema é do perfil, não do momento: reveja se ele ainda deve constar de
+client.PassingProfiles e de config.DefaultTLSProfile.
 ```
 
-Custou zero requisição de perfil: o comando recusou-se a gastar as três que a
-tabela pediria.
+E o remedir do fim usa **a referência que passou**, não o primeiro nome da cadeia:
+remedir um perfil morto só reconfirmaria que ele está morto, sem dizer nada sobre a
+janela.
 
 `ErrCloudflareChallenge` é outra coisa (página "Just a moment"): aí sim
 recoletar `cf_clearance`. A detecção de "ACCESS DENIED" vem **antes** porque o
@@ -542,6 +974,9 @@ positivo.
 ```
 cmd/api/main.go            servidor HTTP: flags, wiring, sinais
 cmd/scraper/main.go        CLI: flags, wiring, sinais
+cmd/wafprobe/main.go       mede perfis na rota search (a que discrimina)
+cmd/routeprobe/main.go     mede perfis nas rotas de calendário (as que não)
+cmd/tlsprobe/main.go       mede o ClientHello de cada perfil, via powhttp
 internal/config            config + leitura de cookies.txt
 internal/client            tls-client, cookie jar, descompressão
   pool.go       rotação de fingerprint com cooldown
@@ -558,7 +993,8 @@ internal/tap               adapter da TAP, um arquivo por responsabilidade:
   transport.go  execução, retry, montagem de cabeçalhos
   dynatrace.go  identificadores de telemetria
 internal/models            structs da API + achatamento (FlattenOffers)
-internal/storage           postgres.go (tratado), redis.go (bruto), schema.sql
+internal/storage           postgres.go (gravação), queries.go (leitura da API),
+                           redis.go (bruto), schema.sql
 internal/api               rotas, DTOs, query.go (binder), erro->status, openapi.yaml
 internal/report            tabela de voos para leitura humana
 ```
@@ -574,12 +1010,15 @@ resposta nem se repete a requisição) → grava tratado no PostgreSQL em **uma
 transação**.
 
 **Paginação:** a API não é paginada por página/cursor. A iteração é o produto
-cartesiano rota × data × cabine (`scraper.Plan.Expand`), concorrente via
+cartesiano rota × data × cabine (`collect.Plan.Expand`), concorrente via
 `sourcegraph/conc/pool`, com `rate.Limiter` e retomada por `search_key`. Uma
 falha isolada não derruba as demais — cada `JobResult` carrega seu erro.
-`scraper.CalendarDates` extrai do `outPanel` as datas com voo, para descobrir
-barato o que vale uma busca completa.
 Para aprofundar, há `booking/availability/searchMoreFlights` (não implementado).
+
+O `outPanel` da resposta de busca traz as datas vizinhas já com o preço mínimo —
+seria o caminho barato para descobrir que datas valem uma busca completa. Está
+**modelado** (`models.DatePanel`, e confere com a tira de datas do site), mas
+**nada o consome**: ver §10.
 
 ### Persistência
 
@@ -592,9 +1031,21 @@ PostgreSQL (`internal/storage/schema.sql`, aplicado na inicialização):
 - **`calendar_return_prices`** — o preço total por combinação ida × volta, com
   `nights` derivado na gravação (modo `returns`). Chave
   `(returns_key, return_date)`.
-- `searches` → `flights` → `segments` / `offers` (CASCADE), do modo `search`.
+- `searches` → `flights` → `segments` → `technical_stops` / `offers` (CASCADE),
+  do modo `search`.
 - `airports` e `airlines`, vindos de `translate` em ambos os modos. Rerodar a mesma busca substitui os dados
 (upsert por `search_key`); `searches.raw_key` referencia a chave no Redis.
+
+**`offers` guarda os dois preços, e a distinção não é cosmética.**
+`total_price` é a viagem inteira; `outbound_price` é a perna de ida — **o número
+que a TAP exibe ao usuário** (§3). É nullable *sem default*: NULL diz "a resposta
+não trouxe a perna", que não é o mesmo que custar zero, e um default numérico
+inventaria um preço que nunca foi coletado.
+
+**`technical_stops` é tabela própria** porque são 0..n por segmento. Guarda
+`location`, `duration_minutes` e os dois horários — em `TIMESTAMP` sem fuso, pela
+mesma regra dos segmentos. Sem ela, um voo que o site anuncia como "1 escala"
+aparecia aqui com zero paradas e nenhuma pista do porquê.
 
 **`adults` é coluna das duas tabelas de calendário, não só da chave.** O total
 para 1 e para 2 passageiros são valores diferentes para a mesma data, coletados e
@@ -659,6 +1110,24 @@ como substring, então acrescentar `DELETE /api/v1/calendar` à tabela passava �
 path já estava documentado. `specBlockFor` recorta o bloco YAML daquele path e
 procura o verbo dentro dele; `TestSpecBlockIsScopedToOnePath` prova que o recorte
 não vaza para o path seguinte, que é a propriedade de que a checagem depende.
+
+**E confere os campos, não só as rotas.** A lacuna apareceu na prática:
+acrescentar `outboundPrice` e `technicalStops` a `storage.FlightOffer` fez a API
+devolver dois campos que a especificação não descrevia, e **teste nenhum
+reclamou** — um cliente gerado a partir dela os perderia.
+`TestSpecCoversFlightOfferFields` percorre as tags `json` da struct **por
+reflexão** e exige entrada no schema. A reflexão é o ponto: uma lista de campos
+escrita à mão no teste envelheceria exatamente como a especificação que ele
+protege. `specSchemaFor` recorta o schema pela mesma razão que `specBlockFor`
+recorta o path — sem isso, um campo documentado em qualquer outro schema
+satisfaria a checagem deste.
+
+Verificado renomeando o campo na especificação de propósito:
+
+```
+--- FAIL: TestSpecCoversFlightOfferFields
+    campo "outboundPrice" de storage.FlightOffer não consta do schema FlightOffer
+```
 
 ### Portas, não implementações
 
@@ -814,10 +1283,27 @@ nessa rota". Agora é 400, com os mesmos conjuntos declarados no `openapi.yaml`.
 
 ## 8. Estado dos testes
 
-`go test ./...` — 185 testes, todos passando e **offline**, em menos de 1 s. Mais 11
-de integração atrás de `-tags=integration`, que exigem PostgreSQL e Redis de pé.
+`go test ./...` — **210 testes, todos passando** e **offline**, em menos de 1 s.
+Mais 12 de integração atrás de `-tags=integration`, que exigem PostgreSQL e Redis
+de pé.
 
-Cobertura medida em 2026-08-04: **56,4%** offline, **66,4%** com integração.
+Cobertura medida em 2026-08-05: **56,3%** offline, **66,5%** com integração.
+
+> **Uma classe de teste que quebrou duas vezes em 06/08, pelo mesmo motivo:**
+> depender da **ordem ou do conteúdo** de `PassingProfiles`, que é política de
+> produção e muda com a medição.
+>
+> `TestPoolRepeatedReportsDoNotLookGlobal` relatava o literal `"firefox_148"` como
+> bloqueado assumindo que era o corrente; quando a lista mudou, o relato virou
+> obsoleto — pela própria proteção do `Pool.Blocked` (§4) — e não houve rotação.
+> `TestDefaultIsUsable` fixava `TLSProfile == "firefox_148"` e passou a barrar a
+> correção do padrão.
+>
+> Os dois agora afirmam **propriedades**: o primeiro relata `p.Current().Profile` e
+> espera `PassingProfiles[1]`; o segundo checa que o padrão é minúsculo e não-vazio,
+> deixando "o padrão é um perfil que passa" para
+> `TestDefaultProfileIsRegisteredAndPassing`, em `internal/client` — que é o único
+> pacote que importa `config` **e** conhece o registro.
 
 > A suíte levava 2,4 s porque o backoff de retry estava fixo em código (2 s) e dois
 > testes o esperavam de verdade. Virou `config.RetryBackoff`; os testes usam 1 ms e
@@ -825,22 +1311,22 @@ Cobertura medida em 2026-08-04: **56,4%** offline, **66,4%** com integração.
 
 | Pacote | Cobertura | O que garante |
 |---|---|---|
-| `config` | 94,9% | ordem dos cookies, valores com `=`, arquivo ausente não é fatal |
+| `config` | 96,0% | ordem dos cookies, valores com `=`, arquivo ausente não é fatal |
 | `collect` | 94,1% | política de persistência, prazo da retomada, orquestração resistente a falha isolada |
-| `client` | 95,1% | perfis do registro, cookies, descompressão idempotente, o spec do `chrome_151`, o pool, a detecção de bloqueio por volume |
-| `models` | 83,7% | desserialização, float vs int, formatos de data, chaves canônicas |
-| `report` | 80,4% | formatação das três tabelas |
-| `tap` | 71,4% | classificação de resposta, retry, rotação, diagnóstico de bloqueio, cabeçalhos por endpoint, calendários |
-| `api` | 78,6% | tradução erro→status, binder de query, cobertura da especificação |
+| `client` | 94,2% | perfis do registro, cookies, descompressão idempotente, o spec do `chrome_151`, o pool, a detecção de bloqueio por volume, as relações medidas entre os perfis Safari/Brave/Opera e a coerência perfil↔motor deles |
+| `models` | 84,8% | desserialização, float vs int, os três formatos de data, chaves canônicas |
+| `report` | 81,6% | formatação das três tabelas, ida vs total, paradas técnicas |
+| `tap` | 72,5% | classificação de resposta, retry, rotação, diagnóstico de bloqueio, cabeçalhos por endpoint, calendários |
+| `api` | 78,6% | tradução erro→status, binder de query, cobertura da especificação (rotas **e** campos) |
 | `platform` | 70,3% | ordem de encerramento, falha na montagem, `BootstrapAdapter`, os dois caminhos de rotação |
-| `storage` | 68,8% (integração) | esquema, idempotência, hora de parede, séries por `adults`, prazo da retomada |
+| `storage` | 69,6% (integração) | esquema, idempotência, hora de parede, séries por `adults`, prazo da retomada, preço da ida e paradas técnicas |
 
 Os de `internal/api` usam dublês nas portas; os demais, **fixtures reais**:
 
 - `internal/models/testdata/calendar_response.json` — calendário LIS→RIO,
   121.785 bytes, 365 datas.
 - `internal/models/testdata/availability_search_response.json` — resposta HTTP
-  200 de 279.287 bytes (34 voos, 105 ofertas).
+  200 de 279.289 bytes (34 voos, 105 ofertas).
 - `internal/models/testdata/calendar_returns_response.json` — matriz ida × volta,
   ~48 KB, 337 datas de retorno.
 - `internal/tap/testdata/access_denied.html` — página 403 do WAF, 92.229
@@ -897,6 +1383,23 @@ os três ML-DSA na frente. É a descoberta do §4 encodada: se
 alguém "atualizar" o perfil e reintroduzir `trust_anchors` (`0xca34`), o teste
 aponta o índice exato. O payload GREASE do ECH é excluído da comparação porque é
 aleatório por construção. O *hash* JA4 continua só verificável na rede.
+
+Os mais recentes fixam as duas armadilhas que **só a comparação com a tela real**
+revelou (§3), e o teste que existe para elas não voltarem:
+
+- **Ida ≠ total.** `TestFlattenKeepsOutboundPrice` e
+  `TestPrintOffersSeparatesOutboundFromTotal`; na integração,
+  `TestOutboundPriceAndTechnicalStopsArePersisted` afirma também que a ausência
+  sobrevive como `NULL`, e não vira zero.
+- **Parada técnica ≠ conexão.** `TestTechnicalStopsAreTyped` ancora no TP67 real
+  da fixture (CWB, 105 min) e afirma que `numberOfStops` é 0 ali —
+  a contradição com o site é a informação, não o defeito.
+  `TestTechnicalStopWithoutClockIsNotAnError` separa ausência de horário de
+  resposta malformada.
+- **A especificação cobre campos, não só rotas.**
+  `TestSpecCoversFlightOfferFields` percorre `storage.FlightOffer` por reflexão.
+  Foi acrescentado porque acrescentar dois campos à resposta **não quebrou nada**
+  — a suíte inteira seguiu verde com a especificação desatualizada.
 
 ### Uma lacuna que os testes expuseram
 
@@ -1006,6 +1509,12 @@ Dois pontos que valem para quem for mexer:
 - [ ] `searchMoreFlights` para paginar além do primeiro lote.
 - [ ] Ida e volta: `-trip-duration` gera os parâmetros, mas `listInbound` e
       `offerMatrix` ainda não são persistidos.
+- [ ] **`outPanel` é coletado e não é usado.** Traz as datas vizinhas já com o
+      preço mínimo — verificado contra o site em 05/08/2026, as 7 datas conferem —
+      e seria o caminho barato para escolher que datas merecem uma busca completa,
+      que custa de 3 a 9 s cada. Está modelado em `models.DatePanel`; falta um
+      extrator e o uso no planejamento. Até 05/08 esta seção afirmava existir um
+      `scraper.CalendarDates` que **nunca existiu**.
 - [ ] **`warnings` fica em dois lugares**: na raiz de `POST /api/v1/searches` e
       dentro de `capture` em `/calendar` e `/returns`. As duas formas estão
       descritas no `openapi.yaml`; uniformizar quebraria clientes, então ficou
@@ -1022,6 +1531,12 @@ Dois pontos que valem para quem for mexer:
       sem abrir, depois de algumas dezenas de buscas acumuladas. A duração parece
       crescer com o volume, mas isso não foi isolado. O pool e o `wafprobe` já
       **detectam** o bloqueio (§4); o que falta é saber quanto esperar.
+      Em 2026-08-06 uma terceira janela **passou de 26 min** sem abrir, e ela já
+      estava fechada antes da primeira requisição da sessão — herdada de coletas
+      anteriores, o que reforça que o contador não zera rápido. Sabe-se agora que
+      o bloqueio é **por rota**: na mesma janela, `calendar` e `calendarReturns`
+      aceitaram 72 requisições. Isso torna a pendência mais estreita — o que falta
+      é a duração, não o escopo.
 - [ ] **A hipótese do ALPS não foi testada.** `Chrome_131` é o único perfil
       Chromium que atravessa o WAF (com identidade Gecko) e o único com a extensão
       ALPS no codepoint antigo `0x4469`; de 133 em diante todos usam `0x44cd` e
@@ -1072,6 +1587,70 @@ Dois pontos que valem para quem for mexer:
       — mas o WAF distingue. Se o experimento acima apontar a ordem, a premissa do
       perfil `chrome_151` (perseguir o JA4 do Chrome real) deixa de ser suficiente
       aqui, ainda que continue correta para reproduzir o ClientHello.
+- [ ] **Duas incoerências perfil↔motor que já existiam, encontradas em 06/08/2026
+      ao acrescentar os seis perfis (§4) e deixadas como estão de propósito.**
+      Ambas violam a premissa do `engine.go`, e nenhuma foi tocada porque as duas
+      envolvem caminhos **medidos como funcionando** — mexer sem remedir trocaria
+      um problema conhecido por um desconhecido.
+
+      A primeira: `safari_ios_18_5` é um perfil de **iOS** e o motor `WebKit`
+      anuncia `Macintosh; Intel Mac OS X 10_15_7`, um UA de **desktop**. É a
+      combinação que o `wafprobe` mediu como passando (34 voos), então corrigir o
+      UA para iPhone é mudar a identidade que funciona. Os dois Safari novos já
+      nascem coerentes (`WebKitIOS26`/`WebKitIOS18`); se um deles for medido como
+      passando, o `safari_ios_18_5` pode migrar. A alternativa é registrar
+      `Safari_16_0`, que é Safari de macOS de verdade — o ClientHello dele é
+      idêntico ao do `safari_ios_18_5`, então o UA desktop atual passaria a ser
+      o correto para ele.
+
+      A segunda: `chrome_133`, `chrome_144` e `chrome_146` compartilham o motor
+      `Chromium`, que anuncia `Chrome/151` e `sec-ch-ua` v151. Três perfis
+      anunciando uma versão que não é a sua. Não custa nada hoje — a família é
+      recusada em `search` de qualquer forma, e nas duas rotas de calendário o
+      Chromium passa — mas é a classe exata de erro que custou horas no §4.
+      `chromiumBrand` em `engine.go` já monta um motor por versão; dar um a cada
+      um desses três é mecânico.
+- [x] ~~A rota `search` passou a exigir `cf_clearance`.~~ **Não exige** — três
+      perfis passam sem cookie (§4). O que estava certo é o outro lado: um jar
+      coerente destrava os Chromium. `DefaultTLSProfile` e `PassingProfiles` foram
+      corrigidos para os perfis medidos passando, e a coleta funciona sem jar.
+- [x] ~~O `-control` do `wafprobe` não deve herdar `DefaultTLSProfile`.~~
+      **Resolvido:** o controle virou uma **cadeia** (`-control auto`, o novo padrão,
+      percorre `client.PassingProfiles`). "Controle recusado" deixou de ser conclusão
+      e passou a ser pergunta que a ferramenta responde — ver §4.
+- [ ] **Testar o Brave com um jar do próprio Brave** (§4). É a única dos quatro
+      combinações Chromium-de-marca com hipótese viável, e o experimento é uma
+      captura no powhttp. Confere, de quebra, os `sec-ch-ua` não medidos.
+- [ ] **Não investir no Opera** até a biblioteca ganhar um perfil moderno: o mais
+      novo é Chromium 105, de 2022, e qualquer identidade que se anuncie sobre ele é
+      incoerente por construção (§4).
+- [ ] **`safari_ios_18_0` é candidato a remoção do registro.** ClientHello de
+      Safari 16 (2022) sob User-Agent de Safari 18.0, recusado nas duas passadas de
+      06/08 enquanto os outros dois Safari passaram. Ver §4.
+- [ ] **O critério da rota `search`, com dois pares experimentais quase limpos.** É a
+      pendência mais promissora do projeto, e os JA4 medidos em 06/08 a estreitaram:
+
+      **Par Gecko** — `firefox_135` ✅ contra `firefox_147` 🔴. Motor idêntico (mesmo
+      User-Agent, mesmos cabeçalhos, mesma ordem) e **mesmo hash de cifradores**
+      (`5b57614c22b0`). A única diferença visível no JA4 é a contagem de extensões,
+      15 contra 17; offline, as duas a mais são `session_ticket` (`0x0023`) e
+      `psk_key_exchange_modes` (`0x002d`).
+
+      **Par WebKit** — `safari_ios_18_5` ✅ contra `safari_ios_18_0` 🔴. Os **dois
+      primeiros componentes do JA4 são idênticos** (`t13d2014h2_a09f3c656075`), e
+      offline a única diferença entre os specs é `signature_algorithms`.
+
+      A hipótese fácil já está descartada: **não é o `0x0203`** (ECDSA-SHA1). O
+      `safari_ios_18_0` o anuncia e falha, mas o `firefox_135` também o anuncia e
+      passa, e o `firefox_147` não o anuncia e falha.
+
+      O experimento que isolaria: derivar `Firefox_147` **removendo** as duas
+      extensões, e `Safari_IOS_18_0` **com os sigalgs do 18_5**, e medir os dois. Cada
+      um muda uma coisa só. Reproduzido em duas passadas cada, sem explicação.
+- [ ] **Quanto tempo o jar vale exatamente.** Medido: vale aos 3 e aos 17 min, não
+      vale aos 87. `config.ClearanceTTL` adota **15 min** e erra de propósito
+      para o lado curto: as duas medições se contradizem (jar de Chrome válido aos 17
+      min, de Brave morto aos ~16), então a idade não é a única variável.
 - [ ] **`go test -race` nunca rodou** — o ambiente não tem compilador C
       (`CGO_ENABLED=0`), e a mensagem é `-race requires cgo`. Ficou mais urgente
       com o `client.Pool`, que é estado mutável compartilhado entre as goroutines

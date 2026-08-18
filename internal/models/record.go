@@ -51,17 +51,33 @@ type OfferRecord struct {
 	SuperSaver        bool    `json:"superSaver"`
 	DiscountedPromo   bool    `json:"discountedWithPromocode"`
 
+	// OutboundPrice é o preço da PERNA DE IDA, não da viagem.
+	//
+	// É o número que a TAP exibe nos cartões de voo ("Economy 460,21 EUR"),
+	// enquanto TotalPrice é o total de ida e volta (1.305,10 na mesma oferta,
+	// medido em 05/08/2026). Os dois são corretos e respondem a perguntas
+	// diferentes; guardar só o total tornava impossível reproduzir o que o
+	// usuário vê na tela.
+	//
+	// Ponteiro porque Offer.Outbound é opcional: nil distingue "a API não trouxe
+	// a perna" de "a perna custa zero".
+	OutboundPrice *float64 `json:"outboundPrice,omitempty"`
+
 	// Itinerário associado.
-	FlightID      int      `json:"flightId"`
-	DurationMin   int      `json:"durationMinutes"`
-	NumberOfStops int      `json:"numberOfStops"`
-	Carriers      []string `json:"carriers"`
-	FlightNumbers []string `json:"flightNumbers"`
-	FareBasis     []string `json:"fareBasis"`
-	RBD           []string `json:"rbd"`
-	DepartureTime string   `json:"departureTime"`
-	ArrivalTime   string   `json:"arrivalTime"`
-	Route         []string `json:"route"`
+	FlightID      int `json:"flightId"`
+	DurationMin   int `json:"durationMinutes"`
+	NumberOfStops int `json:"numberOfStops"`
+	// TechnicalStops conta as paradas técnicas de todos os segmentos. Somadas a
+	// NumberOfStops dão o número de escalas que a TAP mostra ao usuário — ver
+	// TechnicalStop.
+	TechnicalStops int      `json:"technicalStops"`
+	Carriers       []string `json:"carriers"`
+	FlightNumbers  []string `json:"flightNumbers"`
+	FareBasis      []string `json:"fareBasis"`
+	RBD            []string `json:"rbd"`
+	DepartureTime  string   `json:"departureTime"`
+	ArrivalTime    string   `json:"arrivalTime"`
+	Route          []string `json:"route"`
 }
 
 // ID é a chave única da oferta dentro do armazenamento.
@@ -117,10 +133,13 @@ func FlattenOffers(key SearchKey, scrapedAt string, resp *SearchResponse) []Offe
 			if offer.Outbound != nil {
 				rec.FareBasis = offer.Outbound.FareBasis
 				rec.RBD = offer.Outbound.Rbd
+				price := offer.Outbound.TotalPrice.Price
+				rec.OutboundPrice = &price
 			}
 
 			for j := range flight.ListSegment {
 				seg := &flight.ListSegment[j]
+				rec.TechnicalStops += len(seg.TechnicalStops)
 				rec.Carriers = append(rec.Carriers, seg.Carrier)
 				rec.FlightNumbers = append(rec.FlightNumbers, seg.Carrier+seg.FlightNumber)
 				if j == 0 {

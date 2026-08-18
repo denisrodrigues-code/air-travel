@@ -285,9 +285,10 @@ func TestPoolUnderContention(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		// WaitGroup.Go (Go 1.25) faz o Add e o Done, então não há como esquecer um
+		// deles nem como o defer se perder numa saída antecipada — e este corpo tem
+		// dois `return`.
+		wg.Go(func() {
 			for range rounds {
 				fp := p.Current()
 				if fp == nil || fp.Profile == "" || fp.Client == nil {
@@ -302,7 +303,7 @@ func TestPoolUnderContention(t *testing.T) {
 				p.Blocked(fp.Profile, errBlocked)
 				p.Available()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -409,15 +410,23 @@ func TestPoolRepeatedReportsDoNotLookGlobal(t *testing.T) {
 	cl := newClock()
 	p := newTestPool(t, cl, 10*time.Minute, PassingProfiles...)
 
+	// O perfil relatado sai de Current(), não de um literal.
+	//
+	// Fixar "firefox_148" aqui acoplava o teste à ORDEM de PassingProfiles: quando a
+	// medição de 2026-08-06 reescreveu aquela lista, o relato passou a nomear um
+	// perfil que não era o corrente, virou relato obsoleto — pela própria proteção
+	// que o item 3 do §4.3 descreve — e não houve rotação. O teste falhou sem que
+	// nada da lógica do pool tivesse mudado.
+	first := p.Current().Profile
 	for range 8 {
-		p.Blocked("firefox_148", errBlocked)
+		p.Blocked(first, errBlocked)
 	}
 
 	if p.GlobalBlockSuspected() {
 		t.Error("relatos repetidos do mesmo perfil foram lidos como bloqueio por volume")
 	}
-	if got := p.Current().Profile; got != "firefox_147" {
-		t.Errorf("Current() = %q, esperado firefox_147 (uma rotação só)", got)
+	if got, want := p.Current().Profile, PassingProfiles[1]; got != want {
+		t.Errorf("Current() = %q, esperado %q (uma rotação só)", got, want)
 	}
 }
 

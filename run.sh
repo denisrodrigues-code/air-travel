@@ -22,8 +22,10 @@ MARKET="${MARKET:-PT}"
 LANGUAGE="${LANGUAGE:-pt}"
 # Vazio desativa o proxy. Aponte para o powhttp para inspecionar o tráfego.
 PROXY="${PROXY:-}"
-# Vazio usa config.DefaultTLSProfile (firefox_148), a única fonte de verdade.
-# Não fixe um perfil aqui: perfis Chromium tomam 403 do WAF no modo search.
+# Vazio usa config.DefaultTLSProfile, a única fonte de verdade. Não fixe um perfil
+# aqui: o padrão acompanha a medição, e um valor fixado num script envelhece em
+# silêncio — foi o que aconteceu quando este arquivo trazia -tls-profile chrome_151.
+# No modo search, sem cf_clearance no jar, só Gecko/WebKit atravessam o WAF.
 PROFILE="${PROFILE:-}"
 API_PORT="${API_PORT:-8080}"
 
@@ -64,12 +66,13 @@ Comandos:
   redis      lista as chaves de respostas brutas
   psql       abre um shell psql
   api        sobe a API HTTP; docs em http://localhost:8080/docs
-  wafprobe   mede quais perfis TLS atravessam o WAF
+  wafprobe   mede quais perfis TLS atravessam o WAF (rota search)
+  routeprobe mede cada perfil nas rotas de calendário, que não discriminam
   tlsprobe   mede o JA3/JA4 de cada perfil (exige o proxy powhttp)
   demo       up + test + calendar + returns + search + queries
 
 Variáveis: ORIGINS DESTINATIONS CABINS ADULTS START DAYS FROM TO TOP
-           MARKET LANGUAGE PROXY PROFILE API_PORT
+           MARKET LANGUAGE PROXY PROFILE API_PORT COOKIES_FILE
 Exemplos:  ORIGINS=OPO DESTINATIONS=GRU ./run.sh calendar
            MARKET=BR ./run.sh calendar        # preços em BRL
            ./run.sh calendar -resume=false     # flags extras são repassadas
@@ -100,9 +103,13 @@ calendar)
   ;;
 
 returns)
+  # -trip-type R não é decoração: com O a TAP devolve menos datas de retorno e
+  # não resolve o código de cidade para o aeroporto (destino fica RIO em vez de
+  # GIG), então resolved_dest é gravado com a informação pior. Medido em
+  # 05/08/2026: 338 datas e "RIO" com O, 341 e "GIG" com R, preços iguais.
   scraper -mode returns \
     -origins "$ORIGINS" -destinations "$DESTINATIONS" -cabins "$CABINS" \
-    -adults "$ADULTS" -start "$START" -days "$DAYS" \
+    -adults "$ADULTS" -start "$START" -days "$DAYS" -trip-type R \
     -from "$FROM" -to "$TO" -top "$TOP" "${@:2}"
   ;;
 
@@ -126,6 +133,10 @@ psql)
 
 wafprobe)
   go run ./cmd/wafprobe -proxy "$PROXY" -market "$MARKET" -language "$LANGUAGE" "${@:2}"
+  ;;
+
+routeprobe)
+  go run ./cmd/routeprobe -proxy "$PROXY" -market "$MARKET" -language "$LANGUAGE" "${@:2}"
   ;;
 
 tlsprobe)

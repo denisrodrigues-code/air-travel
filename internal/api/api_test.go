@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -715,5 +716,58 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 	if allow := rec.Header().Get("allow"); !strings.Contains(allow, "POST") {
 		t.Errorf("Allow = %q, esperado conter POST", allow)
+	}
+}
+
+// TestSpecCoversFlightOfferFields estende a garantia de TestSpecCoversAllRoutes
+// das rotas para os CAMPOS.
+//
+// A versão anterior conferia só o catálogo de rotas, e essa lacuna custou caro:
+// ao acrescentar outboundPrice e technicalStops a storage.FlightOffer, a API
+// passou a devolver dois campos que openapi.yaml não descrevia, sem que teste
+// nenhum reclamasse. Um cliente gerado a partir da especificação os perderia.
+//
+// A reflexão sobre a struct é de propósito: uma lista de campos escrita à mão
+// aqui envelheceria exatamente como a especificação que o teste protege.
+func TestSpecCoversFlightOfferFields(t *testing.T) {
+	block, ok := specSchemaFor(string(openAPI), "FlightOffer")
+	if !ok {
+		t.Fatal("schema FlightOffer não encontrado em openapi.yaml")
+	}
+
+	typ := reflect.TypeFor[storage.FlightOffer]()
+	for i := range typ.NumField() {
+		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		if !strings.Contains(block, "\n        "+name+":") {
+			t.Errorf("campo %q de storage.FlightOffer não consta do schema FlightOffer", name)
+		}
+	}
+}
+
+// specSchemaFor recorta um schema de components.schemas, pela mesma razão que
+// specBlockFor recorta um path: sem o recorte, um campo documentado em qualquer
+// outro schema satisfaria a checagem deste.
+func specSchemaFor(spec, name string) (string, bool) {
+	header := "\n    " + name + ":\n"
+	start := strings.Index(spec, header)
+	if start < 0 {
+		return "", false
+	}
+	rest := "\n" + spec[start+len(header):]
+
+	for offset := 0; ; {
+		i := strings.Index(rest[offset:], "\n    ")
+		if i < 0 {
+			return rest, true
+		}
+		at := offset + i
+		if strings.HasPrefix(rest[at:], "\n      ") || strings.HasPrefix(rest[at:], "\n    #") {
+			offset = at + 1
+			continue
+		}
+		return rest[:at], true
 	}
 }

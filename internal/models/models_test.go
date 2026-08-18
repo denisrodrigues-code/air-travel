@@ -183,3 +183,130 @@ func TestNoUnknownFields(t *testing.T) {
 		t.Errorf("campo não modelado na resposta da API: %v", err)
 	}
 }
+
+// TestTechnicalStopsAreTyped fixa a parada técnica do TP67 LIS→GIG, que é o
+// caso que expôs a lacuna: a TAP anuncia "1 escala" para esse voo, mas
+// numberOfStops é 0 porque conta apenas conexões.
+//
+// O campo era json.RawMessage e nunca chegava ao banco, então a coluna PARADAS
+// contradizia a interface da TAP sem estar errada.
+func TestTechnicalStopsAreTyped(t *testing.T) {
+	var resp SearchResponse
+	if err := json.Unmarshal(loadFixture(t), &resp); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	var found *Segment
+	total := 0
+	for i := range resp.Data.ListOutbound {
+		flight := &resp.Data.ListOutbound[i]
+		for j := range flight.ListSegment {
+			seg := &flight.ListSegment[j]
+			total += len(seg.TechnicalStops)
+			if seg.FlightNumber == "67" && len(seg.TechnicalStops) > 0 {
+				found = seg
+				if flight.NumberOfStops != 0 {
+					t.Errorf("TP67 numberOfStops = %d, esperado 0: a parada técnica "+
+						"não é conexão e não deve aparecer ali", flight.NumberOfStops)
+				}
+			}
+		}
+	}
+
+	if total != 1 {
+		t.Errorf("a fixture tem %d paradas técnicas, esperado 1", total)
+	}
+	if found == nil {
+		t.Fatal("parada técnica do TP67 não encontrada")
+	}
+
+	stop := found.TechnicalStops[0]
+	if stop.Location != "CWB" {
+		t.Errorf("Location = %q, esperado CWB", stop.Location)
+	}
+	if stop.Duration != 105 {
+		t.Errorf("Duration = %d, esperado 105", stop.Duration)
+	}
+
+	// Data e hora vêm em campos separados e num terceiro formato: DD/MM/AAAA e
+	// HH:MM, nem RFC3339 dos segmentos nem o layout do calendário.
+	arrival, err := stop.ArrivalAt()
+	if err != nil {
+		t.Fatalf("ArrivalAt: %v", err)
+	}
+	if got := arrival.Format("2006-01-02 15:04"); got != "2026-09-01 19:55" {
+		t.Errorf("ArrivalAt = %q, esperado 2026-09-01 19:55", got)
+	}
+
+	departure, err := stop.DepartureAt()
+	if err != nil {
+		t.Fatalf("DepartureAt: %v", err)
+	}
+	if got := departure.Format("2006-01-02 15:04"); got != "2026-09-01 21:40" {
+		t.Errorf("DepartureAt = %q, esperado 2026-09-01 21:40", got)
+	}
+}
+
+// TestTechnicalStopWithoutClockIsNotAnError separa ausência de informação de
+// resposta malformada: uma escala sem horário anunciado devolve o instante zero
+// e nenhum erro, porque derrubar a gravação da busca inteira por isso seria
+// desproporcional. Já um valor presente e ilegível continua erro.
+func TestTechnicalStopWithoutClockIsNotAnError(t *testing.T) {
+	empty := TechnicalStop{Location: "CWB", Duration: 105}
+	at, err := empty.ArrivalAt()
+	if err != nil {
+		t.Errorf("escala sem horário devolveu erro: %v", err)
+	}
+	if !at.IsZero() {
+		t.Errorf("ArrivalAt = %v, esperado o instante zero", at)
+	}
+
+	broken := TechnicalStop{ArrivalDate: "2026-09-01", ArrivalTime: "19:55"}
+	if _, err := broken.ArrivalAt(); err == nil {
+		t.Error("data em ISO foi aceita; o formato da parada técnica é DD/MM/AAAA")
+	}
+}
+
+// TestFlattenKeepsOutboundPrice fixa a distinção que a comparação com o site
+// revelou: a TAP exibe ao usuário o preço da PERNA DE IDA, e só o total da
+// viagem estava sendo guardado.
+//
+// O ponteiro existe para separar "a API não trouxe a perna" de "custa zero".
+func TestFlattenKeepsOutboundPrice(t *testing.T) {
+	var resp SearchResponse
+	if err := json.Unmarshal(loadFixture(t), &resp); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	key := SearchKey{
+		Origin: "LIS", Destination: "RIO", DepartDate: "01092026",
+		CabinClass: "E", Market: "PT", Adults: 1,
+	}
+	records := FlattenOffers(key, "2026-09-01T00:00:00Z", &resp)
+
+	withPrice := 0
+	for _, rec := range records {
+		if rec.OutboundPrice == nil {
+			continue
+		}
+		withPrice++
+		if *rec.OutboundPrice > rec.TotalPrice {
+			t.Errorf("oferta %d: ida %.2f maior que o total %.2f",
+				rec.OfferID, *rec.OutboundPrice, rec.TotalPrice)
+		}
+	}
+
+	if withPrice == 0 {
+		t.Fatal("nenhum registro trouxe o preço da ida")
+	}
+
+	// A contagem de paradas técnicas acompanha o registro achatado, senão o
+	// relatório não teria como não contradizer o site.
+	stops := 0
+	for _, rec := range records {
+		stops += rec.TechnicalStops
+	}
+	if stops == 0 {
+		t.Error("nenhum registro contabilizou a parada técnica do TP67")
+	}
+}

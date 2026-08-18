@@ -173,3 +173,72 @@ func TestPrintSummary(t *testing.T) {
 		}
 	}
 }
+
+// TestPrintOffersSeparatesOutboundFromTotal fixa a correção da divergência
+// medida contra o site em 05/08/2026: a TAP mostrava "Economy 460,21 EUR" e a
+// tabela mostrava 1.305,10 para a MESMA oferta, numa coluna chamada só "VALOR".
+//
+// Os dois números estavam certos — 460,21 é a ida, 1.305,10 é a viagem inteira.
+// Faltava a tabela dizer qual era qual.
+func TestPrintOffersSeparatesOutboundFromTotal(t *testing.T) {
+	outbound := 460.21
+	records := []models.OfferRecord{{
+		OfferID: 1, TotalPrice: 1305.10, OutboundPrice: &outbound,
+		DurationMin: 595, Currency: "EUR", Route: []string{"LIS", "GIG"},
+	}}
+
+	out := render(t, func(b *strings.Builder) error { return PrintOffers(b, records, 0) })
+
+	for _, want := range []string{"IDA", "TOTAL", "460.21", "1305.10"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("saída não contém %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "VALOR") {
+		t.Errorf("coluna VALOR ainda presente; era o nome ambíguo:\n%s", out)
+	}
+	// A ida vem antes do total na linha, senão a leitura inverte os papéis.
+	if strings.Index(out, "460.21") > strings.Index(out, "1305.10") {
+		t.Errorf("a ida saiu depois do total:\n%s", out)
+	}
+}
+
+// TestPrintOffersMarksAbsentOutbound separa "não informado" de "custa zero":
+// uma oferta sem a perna de ida não pode aparecer como 0.00.
+func TestPrintOffersMarksAbsentOutbound(t *testing.T) {
+	records := []models.OfferRecord{{
+		OfferID: 1, TotalPrice: 615.21, OutboundPrice: nil,
+		Currency: "EUR", Route: []string{"LIS", "GIG"},
+	}}
+
+	out := render(t, func(b *strings.Builder) error { return PrintOffers(b, records, 0) })
+
+	if !strings.Contains(out, "—") {
+		t.Errorf("ida ausente não foi marcada com travessão:\n%s", out)
+	}
+	if strings.Contains(out, "0.00") {
+		t.Errorf("ida ausente saiu como 0.00, que é um preço:\n%s", out)
+	}
+}
+
+// TestPrintOffersShowsTechnicalStops fixa a outra metade da divergência: o TP67
+// é "1 escala" no site e numberOfStops 0 na API, porque a parada técnica não é
+// conexão. A tabela mostra as duas sem somá-las.
+func TestPrintOffersShowsTechnicalStops(t *testing.T) {
+	records := []models.OfferRecord{
+		{OfferID: 1, TotalPrice: 100, NumberOfStops: 0, TechnicalStops: 1,
+			Currency: "EUR", Route: []string{"LIS", "GIG"}},
+		{OfferID: 2, TotalPrice: 200, NumberOfStops: 1, TechnicalStops: 0,
+			Currency: "EUR", Route: []string{"LIS", "BSB", "SDU"}},
+	}
+
+	out := render(t, func(b *strings.Builder) error { return PrintOffers(b, records, 0) })
+
+	if !strings.Contains(out, "0 (+1 téc)") {
+		t.Errorf("parada técnica não aparece:\n%s", out)
+	}
+	// A conexão pura continua um número simples, sem sufixo.
+	if strings.Contains(out, "1 (+0 téc)") {
+		t.Errorf("voo sem parada técnica ganhou sufixo:\n%s", out)
+	}
+}

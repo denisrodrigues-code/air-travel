@@ -53,6 +53,24 @@ CREATE TABLE IF NOT EXISTS segments (
         REFERENCES flights (search_key, flight_id) ON DELETE CASCADE
 );
 
+-- Paradas técnicas de um segmento: o avião pousa e decola com o mesmo número de
+-- voo. Tabela própria porque são 0..n por segmento e a TAP as conta como escala
+-- na interface, embora segments.number_of_stops (que conta conexões) seja 0.
+CREATE TABLE IF NOT EXISTS technical_stops (
+    search_key       TEXT      NOT NULL,
+    flight_id        INT       NOT NULL,
+    seq              INT       NOT NULL, -- segmento dentro do voo
+    stop_seq         INT       NOT NULL, -- parada dentro do segmento
+    location         TEXT      NOT NULL,
+    -- Hora local do aeroporto da escala, sem fuso. Mesma regra dos segmentos.
+    arrival_time     TIMESTAMP,
+    departure_time   TIMESTAMP,
+    duration_minutes INT       NOT NULL,
+    PRIMARY KEY (search_key, flight_id, seq, stop_seq),
+    FOREIGN KEY (search_key, flight_id, seq)
+        REFERENCES segments (search_key, flight_id, seq) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     search_key                TEXT           NOT NULL,
     offer_id                  INT            NOT NULL,
@@ -63,6 +81,9 @@ CREATE TABLE IF NOT EXISTS offers (
     commercial_fare_family    TEXT,
     fare_family_rank          INT,
     total_price               NUMERIC(12, 2) NOT NULL,
+    -- Preço só da perna de ida, que é o que a TAP mostra nos cartões de voo.
+    -- total_price é a viagem inteira. NULL quando a resposta não traz a perna.
+    outbound_price            NUMERIC(12, 2),
     base_price                NUMERIC(12, 2) NOT NULL,
     tax                       NUMERIC(12, 2) NOT NULL,
     super_saver               BOOLEAN        NOT NULL DEFAULT FALSE,
@@ -156,6 +177,12 @@ CREATE INDEX IF NOT EXISTS idx_returns_nights
 -- indistinguíveis. O default 1 é o valor histórico: era o padrão do CLI.
 ALTER TABLE calendar_prices        ADD COLUMN IF NOT EXISTS adults INT NOT NULL DEFAULT 1;
 ALTER TABLE calendar_return_prices ADD COLUMN IF NOT EXISTS adults INT NOT NULL DEFAULT 1;
+
+-- outbound_price passou a ser coluna depois de se comparar a coleta com a tela
+-- da TAP: o preço exibido ao usuário é o da perna de ida, e só o total estava
+-- sendo gravado. Nullable sem default porque as linhas antigas não têm o valor —
+-- um default numérico inventaria um preço que nunca foi coletado.
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS outbound_price NUMERIC(12, 2);
 
 -- Correção de tipo para bancos criados antes de se descobrir que os horários da
 -- API são hora local, não UTC.

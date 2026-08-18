@@ -169,6 +169,11 @@ func insertFlights(ctx context.Context, tx pgx.Tx, searchKey string, flights []m
 		                      arrival_terminal, codeshare)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
 
+	const stopQ = `
+		INSERT INTO technical_stops (search_key, flight_id, seq, stop_seq, location,
+		                             arrival_time, departure_time, duration_minutes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
 	for i := range flights {
 		flight := &flights[i]
 
@@ -204,6 +209,29 @@ func insertFlights(ctx context.Context, tx pgx.Tx, searchKey string, flights []m
 				return fmt.Errorf("failed to insert segment %d of flight %d: %w",
 					seq, flight.IDFlight, err)
 			}
+
+			for stopSeq := range seg.TechnicalStops {
+				stop := seg.TechnicalStops[stopSeq]
+
+				arrival, err := stop.ArrivalAt()
+				if err != nil {
+					return fmt.Errorf("flight %d segment %d stop %d: %w",
+						flight.IDFlight, seq, stopSeq, err)
+				}
+				departure, err := stop.DepartureAt()
+				if err != nil {
+					return fmt.Errorf("flight %d segment %d stop %d: %w",
+						flight.IDFlight, seq, stopSeq, err)
+				}
+
+				if _, err := tx.Exec(ctx, stopQ,
+					searchKey, flight.IDFlight, seq, stopSeq, stop.Location,
+					nullIfZero(arrival), nullIfZero(departure),
+					stop.Duration); err != nil {
+					return fmt.Errorf("failed to insert technical stop %d of segment %d, flight %d: %w",
+						stopSeq, seq, flight.IDFlight, err)
+				}
+			}
 		}
 	}
 	return nil
@@ -213,9 +241,9 @@ func insertOffers(ctx context.Context, tx pgx.Tx, searchKey string, resp *models
 	const q = `
 		INSERT INTO offers (search_key, offer_id, flight_id, currency, cabin,
 		                    fare_family, commercial_fare_family, fare_family_rank,
-		                    total_price, base_price, tax, super_saver,
+		                    total_price, outbound_price, base_price, tax, super_saver,
 		                    discounted_with_promocode, fare_basis, rbd)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (search_key, offer_id, flight_id) DO NOTHING`
 
 	// Só se persistem ofertas cujo voo exista na resposta: a chave estrangeira
@@ -231,8 +259,13 @@ func insertOffers(ctx context.Context, tx pgx.Tx, searchKey string, resp *models
 		offer := &resp.Data.Offers.ListOffers[i]
 
 		var fareBasis, rbd []string
+		// outboundPrice fica nil quando a resposta não traz a perna de ida: é o
+		// que distingue "não informado" de "custa zero".
+		var outboundPrice *float64
 		if offer.Outbound != nil {
 			fareBasis, rbd = offer.Outbound.FareBasis, offer.Outbound.Rbd
+			price := offer.Outbound.TotalPrice.Price
+			outboundPrice = &price
 		}
 
 		for _, group := range offer.GroupFlights {
@@ -243,7 +276,8 @@ func insertOffers(ctx context.Context, tx pgx.Tx, searchKey string, resp *models
 				searchKey, offer.IDOffer, group.IDOutBound, currency,
 				nullIfEmpty(offer.OutCabin), nullIfEmpty(offer.OutFareFamily),
 				nullIfEmpty(offer.OutCommercialFareFamily), offer.OutFareFamilyHierarchy,
-				offer.TotalPrice.Price, offer.TotalPrice.BasePrice, offer.TotalPrice.Tax,
+				offer.TotalPrice.Price, outboundPrice,
+				offer.TotalPrice.BasePrice, offer.TotalPrice.Tax,
 				offer.TotalPrice.SuperSaver, offer.DiscountedWithPromocode,
 				fareBasis, rbd); err != nil {
 				return fmt.Errorf("failed to insert offer %d/flight %d: %w",

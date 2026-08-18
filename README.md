@@ -28,6 +28,9 @@ contra a API real e mostra o resultado em SQL. Leva cerca de um minuto.
 <details>
 <summary>Saída esperada</summary>
 
+Os preços são de exemplo: a TAP os move todo dia, e foi para isso que a
+retomada ganhou prazo (`-resume-max-age`, 24 h por padrão).
+
 ```
 Container airtravel-postgres Started
 Container airtravel-redis Started
@@ -117,16 +120,22 @@ curl -s -X POST localhost:8080/api/v1/searches \
   "offers": [
     { "route": "LIS-GIG", "flightNumbers": ["TP71"],
       "departureTime": "2026-09-01T18:55:00Z", "arrivalTime": "2026-09-02T00:50:00Z",
-      "durationMinutes": 595, "numberOfStops": 0,
-      "fareFamily": "DISCINT", "totalPrice": 615.21, "tax": 291.21, "currency": "EUR" }
+      "durationMinutes": 595, "numberOfStops": 0, "technicalStops": 0,
+      "fareFamily": "DISCINT", "outboundPrice": 460.21, "totalPrice": 1305.10,
+      "tax": 291.21, "currency": "EUR" }
   ],
-  "capture": { "tlsProfile": "firefox_148", "engine": "gecko",
+  "capture": { "tlsProfile": "firefox_135", "engine": "gecko",
                "latencyMs": 8800, "flights": 34, "offers": 104 }
 }
 ```
 
 O bloco `capture` responde "qual combinação capturou este preço" — e `rawKey`
 liga a resposta ao payload original no Redis.
+
+> **`outboundPrice` é o valor que a TAP exibe** nos cartões de voo;
+> `totalPrice` é a viagem inteira. E `technicalStops` conta as paradas técnicas,
+> que **não** estão em `numberOfStops` — somados, dão o número de escalas que o
+> site anuncia.
 
 ### `GET /api/v1/flights` · o mesmo por query string
 
@@ -267,8 +276,8 @@ Há um `Makefile` equivalente para quem tem `make` (o WSL costuma não trazer).
 |---|---|
 | `demo` | `up` + `test` + `calendar` + `returns` + `search` + `queries` |
 | `up` / `down` / `reset` | sobe / para / apaga os volumes |
-| `test` | 185 testes offline: fixtures reais + dublês |
-| `test-int` | 11 testes contra PostgreSQL e Redis reais |
+| `test` | 210 testes offline: fixtures reais + dublês |
+| `test-int` | 12 testes contra PostgreSQL e Redis reais |
 | `check` | `gofmt` + `go vet` + testes |
 | `calendar` | melhor preço por data de partida |
 | `returns` | matriz ida × volta |
@@ -277,6 +286,9 @@ Há um `Makefile` equivalente para quem tem `make` (o WSL costuma não trazer).
 | `queries` | mostra o que foi coletado ([`queries.sql`](queries.sql)) |
 | `redis` | lista as chaves das respostas brutas |
 | `psql` | abre um shell no PostgreSQL |
+| `tlsprobe` | qual JA3/JA4 cada perfil TLS produz |
+| `wafprobe` | quais perfis atravessam o WAF, com controle de janela |
+| `routeprobe` | cada perfil nas rotas de calendário, que não discriminam por motor |
 
 Parametrize por variável de ambiente:
 
@@ -361,17 +373,30 @@ famílias tarifárias e impostos.
 
 ```bash
 go run ./cmd/scraper -mode search \
-  -origins LIS -destinations RIO -start 01-09-2026
+  -origins LIS -destinations RIO -start 01-09-2026 -trip-duration 1
 ```
 
 ```
-ROTA     VOOS  PARTIDA      CHEGADA      DURAÇÃO  PARADAS  TARIFA   VALOR
-LIS-GIG  TP71  01/09 18:55  02/09 00:50  9h55m    0        DISCINT  615.21 EUR
-LIS-GIG  TP75  01/09 23:25  02/09 05:20  9h55m    0        DISCINT  615.21 EUR
+ROTA     VOOS  PARTIDA      CHEGADA      DURAÇÃO  PARADAS     CABINE  TARIFA   IDA     TOTAL
+----     ----  -------      -------      -------  -------     ------  ------   ---     -----
+LIS-GIG  TP71  01/09 18:55  02/09 00:50  9h55m    0           M       DISCINT  460.21  1305.10 EUR
+LIS-GIG  TP75  01/09 23:25  02/09 05:20  9h55m    0           M       DISCINT  460.21  1305.10 EUR
+LIS-GIG  TP67  01/09 12:45  01/09 23:00  14h15m   0 (+1 téc)  M       DISCINT  460.21  1305.10 EUR
 ```
 
-**Exige perfil TLS da família Gecko ou WebKit** — o padrão já é `firefox_148`.
-Perfis Chromium recebem 403 do WAF nesta rota; ver
+Sem `-trip-duration` a busca é só-ida, e aí `IDA` e `TOTAL` coincidem — a perna
+de ida *é* a viagem.
+
+> **`IDA` e `TOTAL` são coisas diferentes.** A TAP exibe ao usuário o preço da
+> perna de ida (`460,21` nos cartões de voo); `TOTAL` é a viagem inteira. E
+> `PARADAS` separa conexões de **paradas técnicas** — o TP67 acima não troca de
+> voo, faz uma escala de 105 min em Curitiba, e é por isso que leva 14h15 onde os
+> diretos levam 9h55. O site conta essa parada como "1 escala"; a API não a põe
+> em `numberOfStops`.
+
+**Exige perfil TLS da família Gecko ou WebKit** — o padrão já é `firefox_135`.
+Perfis Chromium recebem 403 do WAF nesta rota, a menos que se forneça um
+`cf_clearance` capturado de um Chrome real; ver
 [Impressão digital](#impressão-digital).
 
 ---
@@ -383,6 +408,7 @@ cmd/api/              servidor HTTP com OpenAPI embutido
 cmd/scraper/          CLI: flags, wiring, tratamento de sinais
 cmd/tlsprobe/         diagnóstico: qual JA3/JA4 cada perfil TLS produz
 cmd/wafprobe/         diagnóstico: quais combinações atravessam o WAF
+cmd/routeprobe/       diagnóstico: cada perfil nas rotas de calendário
 internal/config/      configuração e leitura de cookies
 internal/client/      cliente TLS (tls-client), cookie jar, descompressão
   engine.go             identidade por motor: UA, client hints, ordem de headers
@@ -443,8 +469,13 @@ aplicado automaticamente na inicialização.
 |---|---|
 | `calendar_prices` | melhor preço por rota / data / cabine / tipo de viagem |
 | `calendar_return_prices` | preço total por combinação ida × volta, com `nights` |
-| `searches` → `flights` → `segments` / `offers` | itinerários detalhados (modo `search`) |
+| `searches` → `flights` → `segments` → `technical_stops` / `offers` | itinerários detalhados (modo `search`) |
 | `airports`, `airlines` | dicionários vindos do bloco `translate` das respostas |
+
+> **`offers` guarda dois preços.** `total_price` é a viagem inteira;
+> `outbound_price` é a perna de ida, que é o valor que a TAP mostra na tela.
+> `outbound_price` é `NULL` quando a resposta não traz a perna — o que não é o
+> mesmo que custar zero.
 
 Reexecutar a mesma coleta **atualiza** os preços (upsert por chave), sem
 duplicar — e atualiza também o que muda com eles: `arrival_airport` (que troca
@@ -476,12 +507,12 @@ aponta para a resposta que originou cada linha, fechando a rastreabilidade.
 ## Testes
 
 ```bash
-./run.sh test                      # 185 offline: sem rede, sem banco
-./run.sh up && ./run.sh test-int   # 11 contra PostgreSQL e Redis reais
+./run.sh test                      # 210 offline: sem rede, sem banco
+./run.sh up && ./run.sh test-int   # 12 contra PostgreSQL e Redis reais
 ./run.sh check                     # gofmt + vet + os dois conjuntos
 ```
 
-**185 testes offline** mais **11 de integração** (a suíte offline roda em menos de 1 s), validados contra respostas reais:
+**210 testes offline** mais **12 de integração** (a suíte offline roda em menos de 1 s), validados contra respostas reais:
 
 | Fixture | Tamanho |
 |---|---|
@@ -494,20 +525,20 @@ Cobrem desserialização, formatos de data, filtros de disponibilidade,
 cruzamento oferta↔voo, detecção de bloqueio, perfis de cabeçalho por endpoint,
 expiração de JWT e geração de combinações.
 
-Cobertura por pacote, medida em 2026-08-04 (**56,4%** no agregado offline,
-**66,4%** com integração):
+Cobertura por pacote, medida em 2026-08-05 (**56,3%** no agregado offline,
+**66,5%** com integração):
 
 | Pacote | Cobertura |
 |---|---|
-| `config` | 94,9% |
+| `config` | 92,3% |
 | `collect` | 94,1% |
 | `client` | 95,1% |
-| `models` | 83,7% |
-| `report` | 80,4% |
+| `models` | 84,8% |
+| `report` | 81,6% |
 | `api` | 78,6% |
 | `tap` | 71,4% |
 | `platform` | 70,3% |
-| `storage` | 68,8% (integração) |
+| `storage` | 69,6% (integração) |
 
 Os testes usam **dublês nas portas** — nada de rede, PostgreSQL ou Redis. Os de
 integração ficam atrás da tag `integration` para preservar essa propriedade; eles
@@ -541,6 +572,12 @@ refactor bem-intencionado desfaria sem perceber:
   rotacionar só queima as combinações por algo que passa sozinho.
 - `adults` separa as séries de preço. Misturá-las devolvia duas linhas por data,
   com valores diferentes e nada que as distinguisse.
+- **O preço da ida não é o total da viagem.** A TAP exibe ao usuário o da perna
+  de ida; guardar só o total tornava impossível reproduzir a tela dela.
+- **Parada técnica não é conexão.** `numberOfStops` conta só conexões, então um
+  voo que o site anuncia como "1 escala" chegava aqui com zero paradas.
+- A especificação OpenAPI cobre **campos**, não só rotas: acrescentar um campo à
+  resposta sem documentá-lo quebra o teste.
 
 ---
 
@@ -549,22 +586,28 @@ refactor bem-intencionado desfaria sem perceber:
 O WAF da Cloudflare protege `availability/search` e **discrimina por família de
 motor**, não por qualidade do fingerprint TLS:
 
+Todo o registro, medido **sem cookie** em 2026-08-06, em duas passadas
+(`./run.sh wafprobe -control ""`):
+
 ```
-firefox_148      gecko      OK  34 voos · 105 ofertas · 615.21 EUR
-safari_ios_18_5  webkit     OK  34 voos · 105 ofertas · 615.21 EUR
-chrome_151       chromium   BLOQUEADO  WAF HTTP 403
+firefox_135      gecko      OK  34 voos · 103 ofertas · 566.21 EUR · 4673-4809 ms
+safari_ios_18_5  webkit     OK  34 voos                           · 4746-4866 ms
+safari_ios_26_0  webkit     OK  34 voos                           · 4747-4857 ms
+os 15 restantes             BLOQUEADO  WAF HTTP 403 · 1577-1775 ms
 ```
 
-> **Cookies não mudam isso.** `firefox_148` passa **sem cookie algum**, e
-> `chrome_151` é recusado mesmo com `cf_clearance` válido no jar — medido nos dois
-> sentidos. Quem decide é o motor.
+> **Cookies não são necessários para quem passa** — os três acima trazem voos sem
+> cookie algum. Mas um `cf_clearance` **coerente com a identidade** destrava os
+> Chromium: com o jar de um Chrome 151 real, os sete perfis `chrome_*` também
+> trazem 34 voos. As duas coisas valem ao mesmo tempo.
 >
-> Há também um **bloqueio temporário por volume** que atinge todos os perfis
-> depois de uma sequência de coletas — observado durando de 16 a 24 minutos. Nesse
-> caso rotacionar não resolve, e o código sabe disso: o pool suspende a rotação ao
-> ver três perfis distintos recusados em um minuto, e o `wafprobe` mede um perfil de
-> controle antes de tudo e **se recusa a medir** se ele for bloqueado, em vez de
-> imprimir uma tabela que não quer dizer nada. Ver [`CLAUDE.md`](CLAUDE.md) §4.
+> O mesmo jar num perfil Gecko é recusado: o clearance é atrelado à identidade que
+> o obteve. E ele vale pouco — medido funcionando aos 17 min e bloqueado aos 87.
+>
+> **`firefox_147` e `firefox_148` deixaram de passar** entre 03/08 e 06/08, o que é
+> uma mudança por perfil, não por família. Daí o padrão ter passado a `firefox_135`.
+> Ver [`MEDICOES-PERFIS.md`](MEDICOES-PERFIS.md) para as tabelas completas e os
+> experimentos que separam as variáveis.
 
 Chromium é recusado **mesmo com o JA4 idêntico ao do Chrome real**. A razão: com
 `tls-client` o ClientHello é fiel, mas o User-Agent e os client hints são
@@ -572,7 +615,7 @@ montados à mão — e o Chromium anuncia quatro cabeçalhos de identidade
 (`sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`, `priority`) onde o Gecko
 não anuncia nenhum. Menos superfície, menos divergência.
 
-Por isso o padrão é `firefox_148`, e a coerência perfil↔motor é imposta por
+Por isso o padrão é `firefox_135`, e a coerência perfil↔motor é imposta por
 construção: `Config` não tem campos de User-Agent — eles vêm de
 `client.EngineFor(TLSProfile)`.
 
@@ -597,8 +640,11 @@ requisição para descobrir o que já se sabe.
 Para medir combinações:
 
 ```bash
-go run ./cmd/wafprobe                 # quais atravessam o WAF
-go run ./cmd/wafprobe -control ""     # sem a checagem de janela
+go run ./cmd/wafprobe                 # quais atravessam o WAF (rota search)
+go run ./cmd/wafprobe -cookies cookies.txt   # com jar: destrava os Chromium
+go run ./cmd/wafprobe -control ""     # sem a cadeia de referência
+go run ./cmd/routeprobe               # cada perfil nas rotas de calendário
+go run ./cmd/routeprobe -routes returns
 go run ./cmd/tlsprobe                 # qual JA3/JA4 cada perfil produz
 ```
 
@@ -627,7 +673,7 @@ compilando. **As 6 estão aplicadas:**
 - `internal/api` não importa mais o adapter;
 - `cmd/wafprobe` mede com o adapter real, sem cópia das definições de motor;
 - `internal/platform.Bootstrap` monta e fecha as dependências dos dois comandos;
-- cobertura de 23,4% para **56,2%** offline (**66,0%** com integração).
+- cobertura de 23,4% para **56,3%** offline (**66,5%** com integração).
 
 [`CLAUDE.md`](CLAUDE.md) documenta a engenharia reversa: endpoints, formatos de
 payload, armadilhas de tipagem já pagas (valores monetários que chegam como

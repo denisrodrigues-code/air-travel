@@ -4,17 +4,24 @@ package client
 import (
 	"fmt"
 	"net/url"
+	"sort"
 
 	http "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/cookiejar"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	tls "github.com/bogdanfinn/utls"
 
 	"airtravel/internal/config"
 )
 
-// profileRegistry expõe por nome os perfis relevantes. As variantes _PSK não
-// constam de profiles.MappedTLSClients, por isso o registro é explícito.
+// profileRegistry expõe por nome os perfis relevantes.
+//
+// O registro é explícito, e não derivado de profiles.MappedTLSClients, porque a
+// chave daquele mapa não é `strings.ToLower` do nome da variável em 34 das 79
+// entradas: as variantes PSK mantêm o sufixo maiúsculo (`chrome_146_PSK`) e
+// alguns perfis mudam de nome por completo (`CloudflareCustom` → `cloudscraper`).
+// Derivar os nomes convidaria a esse erro; aqui a normalização é nossa.
 var profileRegistry = map[string]profiles.ClientProfile{
 	"chrome_131":     profiles.Chrome_131,
 	"chrome_133":     profiles.Chrome_133,
@@ -23,7 +30,6 @@ var profileRegistry = map[string]profiles.ClientProfile{
 	"chrome_144_psk": profiles.Chrome_144_PSK,
 	"chrome_146":     profiles.Chrome_146,
 	"chrome_146_psk": profiles.Chrome_146_PSK,
-
 	// Perfil próprio: Chrome_144 + os ML-DSA do Chrome 151. Ver
 	// profile_chrome151.go.
 	"chrome_151": chrome151,
@@ -34,6 +40,76 @@ var profileRegistry = map[string]profiles.ClientProfile{
 	"firefox_147":     profiles.Firefox_147,
 	"firefox_135":     profiles.Firefox_135,
 	"safari_ios_18_5": profiles.Safari_IOS_18_5,
+
+	// Os dois Safari mais recentes da biblioteca depois do 18.5 acima.
+	//
+	// Medido offline (ver TestSafariProfilesMeasuredRelations): o
+	// Safari_IOS_26_0 é o ÚNICO Safari novo com ClientHello distinto — deixa de
+	// enviar a extensão de padding. Já o Safari_IOS_18_0 é byte a byte igual ao
+	// 18.5 já registrado, então o que ele acrescenta é só uma identidade HTTP
+	// diferente, não um fingerprint TLS diferente. O mesmo vale para
+	// Safari_16_0 e Safari_15_6_1, que também são idênticos ao 18.5.
+	"safari_ios_26_0": profiles.Safari_IOS_26_0,
+	"safari_ios_18_0": profiles.Safari_IOS_18_0,
+
+	// Não há perfil de Brave aqui, e a razão é medida: o ClientHello do Brave 151
+	// É o do Chrome 151 — capture de 2026-08-06, JA4 idêntico byte a byte na lista
+	// crua. Um `brave_151` seria o spec do chrome_151 com outra identidade HTTP,
+	// e as duas medições que se fez dele não mostraram ganho: passou exatamente
+	// onde o chrome_151 passa e falhou onde ele falha. Ver CLAUDE.md §4.
+	//
+	// Os perfis `Brave_146`/`Brave_146_PSK` da biblioteca também não constam:
+	// medidos não reproduzindo o navegador que nomeiam, e recusados na rota search
+	// até com o cf_clearance legítimo do próprio Brave, enquanto o chrome_151
+	// passou com aquele mesmo jar.
+
+	// Opera: as duas versões mais recentes da biblioteca.
+	//
+	// Duas advertências medidas. Primeira: Opera_89, _90 e _91 têm ClientHello
+	// IDÊNTICO entre si e igual ao do Chrome_103/105 — são todos Chromium da
+	// era 2022, então acrescentar duas versões diversifica o User-Agent, não o
+	// fingerprint TLS. Segunda: o spec deles NÃO sai por GetClientHelloSpec(),
+	// que devolve "please implement this method"; o handshake funciona porque o
+	// utls resolve por uma tabela interna. Use specFor() para derivá-los.
+	"opera_91": profiles.Opera_91,
+	"opera_90": profiles.Opera_90,
+}
+
+// ProfileNames devolve os nomes de todos os perfis registrados, ordenados.
+//
+// Existe para que ferramentas de medição não mantenham a própria lista: o
+// cmd/wafprobe trazia seis nomes fixos contra os dezoito do registro, então
+// "medir todos os perfis" media um terço deles e não dizia nada sobre o resto.
+// A ordenação é para a saída ser comparável entre execuções.
+func ProfileNames() []string {
+	names := make([]string, 0, len(profileRegistry))
+	for name := range profileRegistry {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// specFor deriva o ClientHelloSpec de um perfil replicando o fallback que o
+// próprio utls faz no handshake (utls/u_parrots.go:3239).
+//
+// Existe porque ClientProfile.GetClientHelloSpec() falha nos perfis herdados —
+// Opera_89/90/91, Chrome_103..109, Safari_16_0 e outros são declarados com
+// tls.EmptyClientHelloSpecFactory, um stub que só devolve erro. Eles funcionam
+// em rede porque applyPresetByID cai em UTLSIdToSpec, uma tabela interna que os
+// cobre. Sem esta função, um teste byte a byte no estilo de
+// profile_chrome151_test.go simplesmente não consegue inspecionar o Opera.
+func specFor(p profiles.ClientProfile) (tls.ClientHelloSpec, error) {
+	spec, err := p.GetClientHelloSpec()
+	if err == nil {
+		return spec, nil
+	}
+
+	spec, fallbackErr := tls.UTLSIdToSpec(p.GetClientHelloId())
+	if fallbackErr != nil {
+		return spec, fmt.Errorf("failed to derive ClientHelloSpec (SpecFactory: %v): %w", err, fallbackErr)
+	}
+	return spec, nil
 }
 
 // Options parametriza a construção do cliente.

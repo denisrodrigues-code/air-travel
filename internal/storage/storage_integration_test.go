@@ -63,7 +63,7 @@ func purgeSentinel(t *testing.T, pg *Postgres, rdb *Redis) {
 	t.Helper()
 	ctx := context.Background()
 
-	// searches leva flights, segments e offers por CASCADE.
+	// searches leva flights, segments, technical_stops e offers por CASCADE.
 	for _, table := range []string{"searches", "calendar_prices", "calendar_return_prices"} {
 		if _, err := pg.pool.Exec(ctx, "DELETE FROM "+table+" WHERE market = $1", sentinelMarket); err != nil {
 			t.Logf("limpeza de %s falhou: %v", table, err)
@@ -555,3 +555,136 @@ func TestDictionariesUpsert(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// TestOutboundPriceAndTechnicalStopsArePersisted fecha as duas lacunas que a
+// comparação com o site da TAP expôs em 05/08/2026, ambas do mesmo tipo: o dado
+// era coletado, desserializado, e descartado na gravação.
+//
+//  1. O preço exibido ao usuário é o da PERNA DE IDA (460,21 no site), e só o
+//     total da viagem (1.305,10) tinha coluna.
+//  2. O TP67 LIS→GIG é "1 escala" no site e numberOfStops 0 na API, porque a
+//     parada é técnica — mesmo número de voo, sem conexão. O campo era
+//     json.RawMessage e não chegava ao banco.
+func TestOutboundPriceAndTechnicalStopsArePersisted(t *testing.T) {
+	pg, rdb := newStores(t)
+	ctx := context.Background()
+	key := uniqueKey(t)
+
+	outbound := models.BoundDetail{TotalPrice: models.Price{Price: 460.21}}
+	resp := &models.SearchResponse{
+		Status: "200",
+		Data: models.SearchData{
+			OfficeID: "TSTOFFICE",
+			ListOutbound: []models.Flight{{
+				IDFlight: 1, Duration: 855, NumberOfStops: 0,
+				ListSegment: []models.Segment{{
+					Carrier: "TP", FlightNumber: "67",
+					DepartureAirport: "TST", ArrivalAirport: "XXX",
+					DepartureDate: "2026-09-01T12:45:00.000Z",
+					ArrivalDate:   "2026-09-01T23:00:00.000Z",
+					Duration:      855,
+					TechnicalStops: []models.TechnicalStop{{
+						Location:      "YYY",
+						ArrivalDate:   "01/09/2026",
+						ArrivalTime:   "19:55",
+						DepartureDate: "01/09/2026",
+						DepartureTime: "21:40",
+						Duration:      105,
+					}},
+				}},
+			}},
+			Offers: models.Offers{Currency: "EUR", ListOffers: []models.Offer{{
+				IDOffer:      1,
+				GroupFlights: []models.GroupFlight{{IDOutBound: 1}},
+				Outbound:     &outbound,
+				TotalPrice:   models.Price{Price: 1305.10, BasePrice: 900, Tax: 405.10},
+			}, {
+				// Sem a perna de ida: a coluna tem de ficar NULL, não zero.
+				IDOffer:      2,
+				GroupFlights: []models.GroupFlight{{IDOutBound: 1}},
+				TotalPrice:   models.Price{Price: 1360.10, BasePrice: 950, Tax: 410.10},
+			}}},
+		},
+	}
+
+	at := time.Now().UTC()
+	rawKey, err := rdb.SaveRaw(ctx, key.String(), at, []byte(`{"status":"200"}`))
+	if err != nil {
+		t.Fatalf("SaveRaw: %v", err)
+	}
+	if err := pg.SaveSearch(ctx, key, resp, rawKey, at); err != nil {
+		t.Fatalf("SaveSearch: %v", err)
+	}
+
+	var price *float64
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT outbound_price FROM offers WHERE search_key = $1 AND offer_id = 1`,
+		key.String()).Scan(&price); err != nil {
+		t.Fatalf("leitura de outbound_price: %v", err)
+	}
+	if price == nil {
+		t.Fatal("outbound_price gravado como NULL para uma oferta que tem a perna de ida")
+	}
+	if *price != 460.21 {
+		t.Errorf("outbound_price = %.2f, esperado 460.21", *price)
+	}
+
+	// A ausência tem de sobreviver como ausência.
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT outbound_price FROM offers WHERE search_key = $1 AND offer_id = 2`,
+		key.String()).Scan(&price); err != nil {
+		t.Fatalf("leitura de outbound_price (oferta 2): %v", err)
+	}
+	if price != nil {
+		t.Errorf("outbound_price = %.2f para oferta sem perna de ida, esperado NULL", *price)
+	}
+
+	var (
+		location           string
+		duration           int
+		arrival, departure *time.Time
+		stops              int
+	)
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT count(*) FROM technical_stops WHERE search_key = $1`,
+		key.String()).Scan(&stops); err != nil {
+		t.Fatalf("contagem de technical_stops: %v", err)
+	}
+	if stops != 1 {
+		t.Fatalf("technical_stops tem %d linhas, esperado 1", stops)
+	}
+
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT location, duration_minutes, arrival_time, departure_time
+		   FROM technical_stops WHERE search_key = $1`,
+		key.String()).Scan(&location, &duration, &arrival, &departure); err != nil {
+		t.Fatalf("leitura de technical_stops: %v", err)
+	}
+	if location != "YYY" || duration != 105 {
+		t.Errorf("parada = %s/%d min, esperado YYY/105", location, duration)
+	}
+	if arrival == nil || departure == nil {
+		t.Fatal("horários da parada técnica gravados como NULL")
+	}
+	// Mesma regra dos segmentos: hora de parede, sem conversão de fuso.
+	if h, m := arrival.Hour(), arrival.Minute(); h != 19 || m != 55 {
+		t.Errorf("chegada à escala = %02d:%02d, esperado 19:55", h, m)
+	}
+	if h, m := departure.Hour(), departure.Minute(); h != 21 || m != 40 {
+		t.Errorf("saída da escala = %02d:%02d, esperado 21:40", h, m)
+	}
+
+	// A parada some junto com a busca: o CASCADE passa por segments.
+	if _, err := pg.pool.Exec(ctx,
+		`DELETE FROM searches WHERE search_key = $1`, key.String()); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT count(*) FROM technical_stops WHERE search_key = $1`,
+		key.String()).Scan(&stops); err != nil {
+		t.Fatalf("contagem após delete: %v", err)
+	}
+	if stops != 0 {
+		t.Errorf("technical_stops manteve %d linhas após apagar a busca", stops)
+	}
+}

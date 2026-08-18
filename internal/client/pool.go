@@ -38,14 +38,34 @@ type Fingerprint struct {
 // PassingProfiles são as combinações medidas como capazes de atravessar o WAF em
 // booking/availability/search (ver `cmd/wafprobe` e CLAUDE.md §4).
 //
-// Os perfis Chromium ficam FORA de propósito: foram medidos como bloqueados nessa
-// rota, então incluí-los na rotação gastaria uma requisição e um 403 para
-// descobrir o que já se sabe.
+// Medidos SEM cookie em 2026-08-07, duas passadas cada, com controle limpo nas
+// duas pontas: são os três únicos dos 16 do registro que trazem voos. Os 13
+// restantes tomam 403 em ~1600 ms.
+//
+// **É a família Gecko inteira, e só ela.** Os perfis Chromium ficam FORA de
+// propósito — medidos bloqueados, então incluí-los gastaria uma requisição e um
+// 403 para redescobrir o conhecido.
+//
+// A lista MUDA com a medição, e já mudou duas vezes em quatro dias. Vale ter isso
+// em conta antes de editá-la de memória:
+//
+//	03/08  firefox_147 e _148 passam
+//	06/08  os dois param de passar; passam firefox_135, safari_ios_18_5 e _26_0
+//	07/08  os dois voltam a passar; os TRÊS WebKit param
+//
+// A leitura de 06/08 era "é por perfil, não por família". Hoje o resultado é
+// limpo por família: Gecko passa inteira, WebKit falha inteira, Chromium falha
+// inteira. Não se sabe o que move isso, e essa é a pendência do §10 do CLAUDE.md
+// — o que se sabe é que uma lista escrita de memória envelhece em dias.
+//
+// Atenção a um nome que parece certo e não é: a chave é `firefox_135`, minúscula.
+// `Firefox_135` é o nome da variável Go na biblioteca, não a chave do registro, e
+// o pool falha ao montar — o que impede a aplicação de subir, porque Rotate é
+// ligado por padrão.
 var PassingProfiles = []string{
-	"firefox_148",
-	"firefox_147",
 	"firefox_135",
-	"safari_ios_18_5",
+	"firefox_147",
+	"firefox_148",
 }
 
 // DefaultCooldown é quanto tempo uma combinação bloqueada fica de fora.

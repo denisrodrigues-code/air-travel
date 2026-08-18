@@ -12,6 +12,14 @@ SELECT 'calendar_return_prices', count(*) FROM calendar_return_prices
 UNION ALL
 SELECT 'searches',               count(*) FROM searches
 UNION ALL
+SELECT 'flights',                count(*) FROM flights
+UNION ALL
+SELECT 'segments',               count(*) FROM segments
+UNION ALL
+SELECT 'technical_stops',        count(*) FROM technical_stops
+UNION ALL
+SELECT 'offers',                 count(*) FROM offers
+UNION ALL
 SELECT 'airports',               count(*) FROM airports
 ORDER BY 1;
 
@@ -80,8 +88,19 @@ SELECT s.carrier || s.flight_number                      AS voo,
        -- um esta no fuso do seu aeroporto. Ver models.ParseWallClock.
        (f.duration_minutes / 60) || 'h' ||
          lpad((f.duration_minutes % 60)::text, 2, '0')     AS duracao,
-       o.fare_family                                       AS tarifa,
-       o.total_price || ' ' || o.currency                   AS valor
+       -- number_of_stops conta apenas CONEXÕES. A parada técnica (mesmo número
+       -- de voo, sem troca de aeronave) está em technical_stops, e é ela que
+       -- explica um voo de 14h15 na mesma rota em que os diretos levam 9h55.
+       -- A TAP soma as duas ao anunciar "1 escala" ao usuário.
+       f.number_of_stops                                    AS conexoes,
+       (SELECT count(*) FROM technical_stops t
+         WHERE t.search_key = s.search_key
+           AND t.flight_id = s.flight_id)                   AS escalas_tec,
+       o.fare_family                                        AS tarifa,
+       -- Dois preços, e a distinção não é cosmética: a TAP exibe ao usuário o
+       -- da perna de IDA; total_price é a viagem inteira.
+       coalesce(o.outbound_price::text, '-')                AS ida,
+       o.total_price || ' ' || o.currency                   AS total
 FROM segments s
 JOIN flights f ON f.search_key = s.search_key AND f.flight_id = s.flight_id
 JOIN offers  o ON o.search_key = s.search_key AND o.flight_id = s.flight_id
